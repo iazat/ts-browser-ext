@@ -32,6 +32,26 @@ function enableProxy() {
   }
 }
 
+// clearBrowserProxy resets the browser's proxy back to direct. Without this,
+// disabling the proxy (or losing the native host) leaves chrome.proxy pointing
+// at a dead 127.0.0.1:<port>, breaking all browsing with
+// ERR_PROXY_CONNECTION_FAILED. See tailscale/ts-browser-ext#18.
+function clearBrowserProxy() {
+  chrome.proxy.settings.set(
+    { value: { mode: "direct" }, scope: "regular" },
+    () => {
+      if (chrome.runtime.lastError) {
+        console.error(
+          "Error resetting proxy to direct:",
+          chrome.runtime.lastError.message
+        );
+      } else {
+        console.log("Browser proxy reset to direct.");
+      }
+    }
+  );
+}
+
 function disableProxy() {
   console.log("disableProxy called");
   if (nmPort && !deadPort) {
@@ -47,6 +67,7 @@ function disableProxy() {
   }
   proxyEnabled = false;
   lastProxyPort = 0;
+  clearBrowserProxy();
   console.log(
     "Proxy disabled, proxyEnabled:",
     proxyEnabled,
