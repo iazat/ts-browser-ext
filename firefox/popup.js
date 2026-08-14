@@ -1,10 +1,43 @@
 var lastStatus;
 
+function browseToURL() {
+  if (lastStatus && lastStatus.browseToURL) {
+    browser.tabs.create({ url: lastStatus.browseToURL });
+  }
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   const toggleSlider = document.getElementById("toggleSlider");
   const slider = document.querySelector(".slider");
   const settingsButton = document.getElementById("settingsButton");
   const stateDisplay = document.getElementById("state");
+  const exitNodeRow = document.getElementById("exitNodeRow");
+  const exitNodeSelect = document.getElementById("exitNodeSelect");
+
+  function renderExitNodes(status) {
+    const nodes = status.exitNodes || [];
+    if (!status.running || nodes.length === 0) {
+      exitNodeRow.hidden = true;
+      return;
+    }
+    exitNodeRow.hidden = false;
+    const selected = status.exitNode || "";
+    let html = `<option value=""${selected ? "" : " selected"}>None</option>`;
+    for (const n of nodes) {
+      const machineName = n.name.split(".")[0]; // FQDN -> admin-panel machine name
+      const label = machineName + (n.online ? "" : " (offline)");
+      const isSel = n.name === selected ? " selected" : "";
+      html += `<option value="${n.name}"${isSel}>${label}</option>`;
+    }
+    exitNodeSelect.innerHTML = html;
+  }
+
+  exitNodeSelect.addEventListener("change", () => {
+    browser.runtime.sendMessage({
+      command: "setExitNode",
+      exitNode: exitNodeSelect.value,
+    });
+  });
   let isConnected = false;
   let isLoading = true;
   let hasReceivedInitialState = false;
@@ -29,19 +62,50 @@ document.addEventListener("DOMContentLoaded", () => {
     isLoading = false;
     hasReceivedInitialState = true;
     if (status.error) {
-      if (status.error === "State: Stopped") {
+      const m = /^State: (.+)$/.exec(status.error);
+      const state = m ? m[1] : null;
+      if (state === "Stopped") {
         stateDisplay.textContent = "Disconnected";
         isConnected = false;
+        updateSliderState();
+        renderExitNodes(status);
+        return;
+      }
+      // Transient states while Tailscale brings the connection up or waits for
+      // device approval — show a spinner instead of a scary error.
+      if (state === "Starting" || state === "NoState") {
+        stateDisplay.textContent = "Connecting…";
+        isLoading = true;
+        updateSliderState();
+        return;
+      }
+      if (state === "NeedsMachineAuth") {
+        stateDisplay.textContent = "Waiting for approval…";
+        isLoading = true;
         updateSliderState();
         return;
       }
       stateDisplay.textContent = `Error: ${status.error}`;
+      isConnected = false;
+      updateSliderState();
+      renderExitNodes(status);
       return;
     }
     if (status.needsLogin) {
+      lastStatus = status; // so the login click handler can read browseToURL
       stateDisplay.innerHTML = status.browseToURL
-        ? `<b><a href='${status.browseToURL}'>Log in</a></b>`
+        ? `<b><a href='#login' id='loginLink'>Log in</a></b>`
         : "<b>Login required; no URL</b>";
+      const loginLink = document.getElementById("loginLink");
+      if (loginLink) {
+        loginLink.addEventListener("click", (e) => {
+          e.preventDefault();
+          browseToURL();
+        });
+      }
+      isConnected = false;
+      updateSliderState();
+      renderExitNodes(status);
       return;
     }
     if (typeof status === "string" && status === "Disconnected") {
@@ -56,6 +120,7 @@ document.addEventListener("DOMContentLoaded", () => {
         : "Disconnected";
       isConnected = status.running;
       updateSliderState();
+      renderExitNodes(status);
     }
   }
 
@@ -64,8 +129,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
     // firefox requires that extensions settings proxies have private browsing access
     if (msg.needsIncognitoPermission) {
-      console.log("Private browsing permission needed")
-      stateDisplay.innerHTML = `<b><a href="https://support.mozilla.org/en-US/kb/extensions-private-browsing#w_enabling-or-disabling-extensions-in-private-windows">Enable private browsing access.</a></b>`
+      console.log("Private browsing permission needed");
+      stateDisplay.innerHTML = `<b><a href="https://support.mozilla.org/en-US/kb/extensions-private-browsing#w_enabling-or-disabling-extensions-in-private-windows">Enable private browsing access.</a></b>`;
       return;
     }
 

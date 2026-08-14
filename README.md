@@ -22,6 +22,9 @@ can keep work and personal tailnets fully separate.
   and a **Log out** button. No need to remove/re-add the extension to log out.
 - ⏳ **Honest connection states** — "Connecting…" / "Waiting for approval…"
   while Tailscale brings the link up, instead of a scary error flash.
+- 🦊 **Firefox parity** — the `firefox/` copy carries the same popup, exit node
+  picker and proxy handling as the Chrome one, and no longer leaves a dead
+  `proxy.onRequest` handler installed after disconnect.
 - 🩹 Misc fixes: correct Chrome-vs-Firefox detection during install, the
   missing `need-install` icon, and live popup refresh after login.
 

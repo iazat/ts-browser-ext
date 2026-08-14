@@ -83,9 +83,25 @@
       }
 
       #state {
-        white-space: nowrap;
         margin-bottom: 16px;
         font-size: 14px;
+        word-break: break-word;
+      }
+
+      #state pre {
+        white-space: pre-wrap;
+        word-break: break-all;
+        background: #f0eeec;
+        border: 1px solid #e6e3e1;
+        border-radius: 6px;
+        padding: 8px;
+        margin: 8px 0 0;
+        font-size: 11px;
+        line-height: 1.4;
+        max-height: 140px;
+        overflow: auto;
+        user-select: all;
+        cursor: text;
       }
 
       button {
@@ -119,6 +135,47 @@
         border-radius: 4px;
         background-color: #f5f5f5;
         margin-bottom: 16px;
+      }
+
+      .credit {
+        margin-top: 20px;
+        padding-top: 12px;
+        border-top: 1px solid #e6e3e1;
+        font-size: 11px;
+        line-height: 1.5;
+        color: #706e6c;
+      }
+
+      .credit a {
+        color: #4b70cc;
+        text-decoration: none;
+      }
+
+      .credit a:hover {
+        text-decoration: underline;
+      }
+
+      .exit-node {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        margin-top: 16px;
+        font-size: 14px;
+      }
+
+      .exit-node select {
+        padding: 8px;
+        padding-right: 32px;
+        border: 1px solid #ddd;
+        border-radius: 6px;
+        background-color: #f5f5f5;
+        font-size: 14px;
+        cursor: pointer;
+        appearance: none;
+        -webkit-appearance: none;
+        background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none'%3E%3Cpath d='M3 4.5L6 7.5L9 4.5' stroke='%231F1E1E' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+        background-repeat: no-repeat;
+        background-position: right 10px center;
       }
     </style>
   </head>
@@ -311,13 +368,30 @@
           ></path>
         </svg>
       </div>
-      <div class="slider-container">
-        <input type="checkbox" id="toggleSlider" class="slider" checked />
-      </div>
+      <label class="slider-container">
+        <input
+          type="checkbox"
+          id="toggleSlider"
+          class="slider-input"
+          style="display: none"
+          checked
+        />
+        <span class="slider connected no-transition"></span>
+      </label>
     </div>
-    <div id="state">Disconnected</div>
+    <div id="state" class="status"></div>
+    <div id="exitNodeRow" class="exit-node" hidden>
+      <label for="exitNodeSelect">Exit node</label>
+      <select id="exitNodeSelect"></select>
+    </div>
     <div class="controls">
       <button id="settingsButton" class="settings-button">Settings</button>
     </div>
+    <footer class="credit">
+      Based on
+      <a href="https://github.com/tailscale/ts-browser-ext" target="_blank" rel="noreferrer">Tailscale</a>'s
+      code, reworked with 🖤 by
+      <a href="https://github.com/iazat" target="_blank" rel="noreferrer">iazat</a>.
+    </footer>
   </body>
 </html>
