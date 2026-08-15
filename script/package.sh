@@ -38,6 +38,7 @@ package() {
     cp "$src/$f" "$stage/"
   done
   cp -r "$src/fonts" "$stage/"
+  cp -r "$src/icons" "$stage/"
   cp LICENSE "$stage/"
 
   (cd "$stage" && zip -qr "../ts-browser-ext-$name-v$version.zip" .)

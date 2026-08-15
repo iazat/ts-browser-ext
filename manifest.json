@@ -1,22 +1,33 @@
 {
-    "manifest_version": 3,
-    "name": "Tailscale Extension",
-    "version": "1.1",
-    "description": "A Tailscale client that runs as a browser extension, permitting use of different tailnets in differenet browser profiles, without affecting the system VPN or networking settings.",
-    "permissions": [
-        "proxy",
-        "background",
-        "storage",
-        "nativeMessaging"
-    ],
-    "host_permissions": [
-        "<all_urls>"
-    ],
-    "background": {
-        "service_worker": "background.js"
-    },
-    "action": {
-        "default_popup": "popup.html",
-        "default_icon": "icon.png"
+  "manifest_version": 3,
+  "name": "TailExt",
+  "version": "1.1",
+  "description": "Give each browser profile its own Tailscale tailnet, using a local proxy from a companion app, without changing your system VPN settings.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": [
+    "proxy",
+    "background",
+    "storage",
+    "nativeMessaging"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
     }
+  }
 }
