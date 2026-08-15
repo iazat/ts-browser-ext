@@ -15,10 +15,13 @@ const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 // Colours per connection state. Only these change between states — the shapes
 // stay put, so the toolbar icon does not appear to morph as the link comes up.
+// Offline deliberately inverts: the field goes green and the shapes go dark,
+// rather than the arrows simply dimming. It reads as "off" at a glance even
+// when the icon is too small to make out what the shapes are.
 const PALETTE = {
-  online: { bg: "#2B6BF5", dot: "#050505", arrow: "#22EFFF" },
-  offline: { bg: "#5B6068", dot: "#3A3E44", arrow: "#9BA3AC" },
-  "need-install": { bg: "#2B6BF5", dot: "#050505", arrow: "#FFB020" },
+  online: { bg: "#0A1409", dot: "#2D473C", arrow: "#6FF25E" },
+  offline: { bg: "#37533F", dot: "#071007", arrow: "#071007" },
+  "need-install": { bg: "#0A1409", dot: "#4A3620", arrow: "#F0A03E" },
 };
 
 // Three arrows converging on the centre of a nine-cell grid, on a 1024 canvas.
@@ -63,13 +66,16 @@ function updatePopups(markup) {
     .split("\n")
     .map((line, i) => (i === 0 ? line : "        " + line))
     .join("\n");
+  // Matched by attribute rather than by position: this script emits the tag
+  // with class="mark" partway along, so anchoring on "<svg class=" made the
+  // first run succeed and every run after it fail to find its own output.
+  const MARK = /<svg\b[^>]*\bclass="mark"[^>]*>[\s\S]*?<\/svg>/;
+
   for (const dir of [ROOT, path.join(ROOT, "firefox")]) {
     const file = path.join(dir, "popup.html");
     const s = fs.readFileSync(file, "utf8");
-    const i = s.indexOf('<svg class="mark"');
-    if (i === -1) throw new Error(`no inline mark found in ${file}`);
-    const j = s.indexOf("</svg>", i) + "</svg>".length;
-    fs.writeFileSync(file, s.slice(0, i) + indented + s.slice(j));
+    if (!MARK.test(s)) throw new Error(`no inline mark found in ${file}`);
+    fs.writeFileSync(file, s.replace(MARK, indented));
   }
 }
 
