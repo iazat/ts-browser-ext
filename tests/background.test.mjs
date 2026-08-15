@@ -182,6 +182,24 @@ for (const target of TARGETS) {
         `expected ${expected} in ${JSON.stringify(prompt.installCmd)}`
       );
     });
+
+    // This fork's native host understands set-exit-node and reports exitNodes;
+    // upstream's does not. Pointing people at the wrong module hands them a
+    // host that half-works, with no hint as to why, so pin it to this repo.
+    test("the install prompt installs this fork, not upstream", () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      connectPopup(calls);
+
+      const { installCmd } = calls.toPopup.find((m) => m.installCmd);
+      assert.ok(
+        installCmd.includes("github.com/iazat/ts-browser-ext"),
+        `install prompt points somewhere else: ${JSON.stringify(installCmd)}`
+      );
+      assert.ok(
+        !installCmd.includes("tailscale/ts-browser-ext"),
+        "install prompt still points at upstream, whose host has no exit node support"
+      );
+    });
   });
 }
 
