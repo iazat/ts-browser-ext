@@ -11,9 +11,22 @@ import { loadBackground, connectPopup, sendCommand, plain } from "./webext-mock.
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 
+// isProxied answers "is the browser currently routed through the native host?"
+// The two engines do it differently: Chrome sets a proxy setting, Firefox
+// registers a proxy.onRequest handler.
 const TARGETS = [
-  { name: "chrome", file: path.join(ROOT, "background.js"), flavor: "chrome" },
-  { name: "firefox", file: path.join(ROOT, "firefox", "background.js"), flavor: "browser" },
+  {
+    name: "chrome",
+    file: path.join(ROOT, "background.js"),
+    flavor: "chrome",
+    isProxied: (calls) => calls.proxyModes.at(-1) === "fixed_servers",
+  },
+  {
+    name: "firefox",
+    file: path.join(ROOT, "firefox", "background.js"),
+    flavor: "browser",
+    isProxied: (calls) => calls.proxyListeners.length === 1,
+  },
 ];
 
 // bringUp puts the extension in the state it reaches once the native host has
@@ -109,6 +122,51 @@ for (const target of TARGETS) {
 
       assert.deepEqual(plain(reply), { status: "Disconnected" });
       assert.ok(calls.proxyModes.includes("direct"));
+    });
+
+    // The native host reports its proxy port once, in procRunning at startup,
+    // and its listener stays up across a down/up cycle — "up" comes back as a
+    // status message, not another procRunning. So re-enabling has to point the
+    // browser back at the remembered port itself, or the toggle is one-way:
+    // it turns off and never comes back on without reloading the extension.
+    test("re-enabling routes the browser through the proxy again", () => {
+      const { sandbox, calls } = loadBackground(target.file, target.flavor);
+      bringUp(calls);
+      assert.ok(target.isProxied(calls), "expected to be proxied after connecting");
+
+      sandbox.disableProxy();
+      assert.ok(!target.isProxied(calls), "expected direct browsing after disabling");
+
+      sandbox.enableProxy();
+
+      assert.ok(
+        target.isProxied(calls),
+        "the browser was left on a direct connection after re-enabling — the toggle only works once"
+      );
+    });
+
+    test("re-enabling also tells the native host to come back up", () => {
+      const { sandbox, calls } = loadBackground(target.file, target.flavor);
+      bringUp(calls);
+      sandbox.disableProxy();
+      calls.toNativeHost.length = 0;
+
+      sandbox.enableProxy();
+
+      assert.ok(calls.toNativeHost.some((m) => m.cmd === "up"));
+    });
+
+    test("does not resurrect a proxy after the native host dies", () => {
+      const { sandbox, calls } = loadBackground(target.file, target.flavor);
+      bringUp(calls);
+      calls.onNativeDisconnect(); // host gone; its listener went with it
+
+      sandbox.enableProxy();
+
+      assert.ok(
+        !target.isProxied(calls),
+        "pointed the browser at a port whose listener no longer exists"
+      );
     });
 
     test("shows the install prompt with its own browser byte", () => {
