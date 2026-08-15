@@ -20,11 +20,39 @@ function enableProxy() {
     return;
   }
 
-  if (lastProxyPort) {
-    nmPort.postMessage({ cmd: "get-status" });
-  } else {
-    nmPort.postMessage({ cmd: "up" });
+  nmPort.postMessage({ cmd: "up" });
+
+  // Point the browser back at the native host's proxy. Nothing else will: the
+  // host reports its port once, in procRunning at startup, and answers "up"
+  // with a status message. Its listener outlives a down/up cycle, so the port
+  // we were told is still good.
+  if (nativeProxyPort) {
+    setProxy(nativeProxyPort);
   }
+}
+
+// clearBrowserProxy resets the browser's proxy back to direct. Without this,
+// disabling the proxy (or losing the native host) leaves the onRequest handler
+// pointing at a dead 127.0.0.1:<port>, breaking all browsing.
+// See tailscale/ts-browser-ext#18.
+function clearBrowserProxy() {
+  if (activeProxyHandler) {
+    browser.proxy.onRequest.removeListener(activeProxyHandler);
+    activeProxyHandler = null;
+  }
+  browser.proxy.settings
+    .set({
+      value: {
+        mode: "direct",
+      },
+      scope: "regular",
+    })
+    .then(() => {
+      console.log("Browser proxy reset to direct.");
+    })
+    .catch((error) => {
+      console.error("Error resetting proxy to direct:", error.message);
+    });
 }
 
 function disableProxy() {
@@ -42,6 +70,7 @@ function disableProxy() {
   }
   proxyEnabled = false;
   lastProxyPort = 0;
+  clearBrowserProxy();
   console.log(
     "Proxy disabled, proxyEnabled:",
     proxyEnabled,
@@ -72,6 +101,12 @@ browser.runtime.onConnect.addListener((port) => {
   });
 
   sendPopupStatus();
+
+  // Pull a fresh status from the native host so the popup reflects any state
+  // change (e.g. login completing) that happened while it was closed.
+  if (nmPort && !deadPort) {
+    nmPort.postMessage({ cmd: "get-status" });
+  }
 });
 
 // browserByte returns either "F" for Firefox or "C" for chrome.
@@ -130,6 +165,7 @@ function connectToNativeHost() {
 
   nmPort.onDisconnect.addListener(() => {
     deadPort = true;
+    nativeProxyPort = 0; // the host is gone, and so is the port it was listening on
     setPopupIcon("need-install");
     disableProxy();
     const error = browser.runtime.lastError;
@@ -149,6 +185,7 @@ function connectToNativeHost() {
     }
     if (message.procRunning) {
       if (message.procRunning.port) {
+        nativeProxyPort = message.procRunning.port;
         setProxy(message.procRunning.port);
       } else if (message.procRunning.errror) {
         console.log(
@@ -172,29 +209,35 @@ function connectToNativeHost() {
 var lastProxyPort = 0;
 var lastStatus = {}; // last Go status
 
+// nativeProxyPort is the port the native host's proxy listens on, as reported
+// in procRunning. Unlike lastProxyPort it survives disableProxy(), because the
+// host keeps listening after "down" — only losing the host itself invalidates
+// it.
+var nativeProxyPort = 0;
+
+// activeProxyHandler is the browser.proxy.onRequest listener currently
+// registered, if any. It has to be kept around so it can be handed back to
+// removeListener: proxyHandler returns a fresh closure each call, so removing
+// a newly built one would be a no-op and leave the old handler installed.
+var activeProxyHandler = null;
+
 function setProxy(proxyPort) {
-  const handleProxyRequest = proxyHandler(proxyPort)
-  if (proxyPort) {
-    proxyEnabled = true;
-    lastProxyPort = proxyPort;
-    console.log("Enabling proxy at port: " + proxyPort);
-  } else {
+  if (!proxyPort) {
     proxyEnabled = false;
     console.log("Disabling proxy...");
-    browser.proxy.onRequest.removeListener(handleProxyRequest)
-    browser.proxy.settings
-      .set({
-        value: {
-          mode: "direct",
-        },
-        scope: "regular",
-      })
-      .then(() => {
-        console.log("Proxy disabled.");
-      });
+    clearBrowserProxy();
     return;
   }
-  browser.proxy.onRequest.addListener(handleProxyRequest, { urls: ["<all_urls>"] })
+  proxyEnabled = true;
+  lastProxyPort = proxyPort;
+  console.log("Enabling proxy at port: " + proxyPort);
+  if (activeProxyHandler) {
+    browser.proxy.onRequest.removeListener(activeProxyHandler);
+  }
+  activeProxyHandler = proxyHandler(proxyPort);
+  browser.proxy.onRequest.addListener(activeProxyHandler, {
+    urls: ["<all_urls>"],
+  });
 }
 
 var profileID = "";
@@ -241,16 +284,26 @@ browser.storage.local.get("profileId").then((result) => {
 // Listener for messages from the popup
 browser.runtime.onMessage.addListener((message, sender) => {
   console.log("bg: Received message:", message);
+  if (message.command === "setExitNode") {
+    if (nmPort && !deadPort) {
+      nmPort.postMessage({ cmd: "set-exit-node", exitNode: message.exitNode });
+    }
+    return;
+  }
   if (message.command === "toggleProxy") {
     console.log("bg: toggleProxy received, current proxy=" + proxyEnabled);
     proxyEnabled = !proxyEnabled;
+    let response;
     if (proxyEnabled) {
       console.log("bg: Enabling proxy");
       enableProxy();
+      response = { status: lastStatus };
     } else {
       console.log("bg: Disabling proxy");
       disableProxy();
+      response = { status: "Disconnected" };
     }
-    return Promise.resolve({ status: lastStatus });
+    setPopupIcon(proxyEnabled);
+    return Promise.resolve(response);
   }
 });

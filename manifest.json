@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "Tailscale Extension",
-    "version": "1.0",
+    "version": "1.1",
     "description": "A Tailscale client that runs as a browser extension, permitting use of different tailnets in differenet browser profiles, without affecting the system VPN or networking settings.",
     "permissions": [
         "proxy",

@@ -25,10 +25,14 @@ function enableProxy() {
     return;
   }
 
-  if (lastProxyPort) {
-    nmPort.postMessage({ cmd: "get-status" });
-  } else {
-    nmPort.postMessage({ cmd: "up" });
+  nmPort.postMessage({ cmd: "up" });
+
+  // Point the browser back at the native host's proxy. Nothing else will: the
+  // host reports its port once, in procRunning at startup, and answers "up"
+  // with a status message. Its listener outlives a down/up cycle, so the port
+  // we were told is still good.
+  if (nativeProxyPort) {
+    setProxy(nativeProxyPort);
   }
 }
 
@@ -158,6 +162,7 @@ function connectToNativeHost() {
 
   nmPort.onDisconnect.addListener(() => {
     deadPort = true;
+    nativeProxyPort = 0; // the host is gone, and so is the port it was listening on
     setPopupIcon("need-install");
     disableProxy();
     const error = chrome.runtime.lastError;
@@ -177,6 +182,7 @@ function connectToNativeHost() {
     }
     if (message.procRunning) {
       if (message.procRunning.port) {
+        nativeProxyPort = message.procRunning.port;
         setProxy(message.procRunning.port);
       } else if (message.procRunning.errror) {
         console.log(
@@ -199,6 +205,12 @@ function connectToNativeHost() {
 
 var lastProxyPort = 0;
 var lastStatus = {}; // last Go status
+
+// nativeProxyPort is the port the native host's proxy listens on, as reported
+// in procRunning. Unlike lastProxyPort it survives disableProxy(), because the
+// host keeps listening after "down" — only losing the host itself invalidates
+// it.
+var nativeProxyPort = 0;
 
 function setProxy(proxyPort) {
   if (proxyPort) {

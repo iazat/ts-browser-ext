@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"log/syslog"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -71,7 +70,7 @@ To register it once, run:
 
 	h := newHost(os.Stdin, os.Stdout)
 
-	if w, err := syslog.Dial("tcp", "localhost:5555", syslog.LOG_INFO, "browser"); err == nil {
+	if w, err := dialDebugSyslog(); err == nil {
 		log.Printf("syslog dialed")
 		h.logf = func(f string, a ...any) {
 			fmt.Fprintf(w, f, a...)
