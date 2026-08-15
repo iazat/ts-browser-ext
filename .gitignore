@@ -3,3 +3,4 @@
 
 # Extension test tooling
 node_modules/
+dist/

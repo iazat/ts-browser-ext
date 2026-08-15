@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # Tags can be pushed at any commit, so re-run the checks here rather
+      # than trusting that this one went through a pull request.
+      - name: Verify
+        run: |
+          go build ./...
+          go vet ./...
+          go test ./...
+          npm ci
+          npx playwright install --with-deps chromium
+          npm test
+
+      - name: Package extensions
+        run: script/package.sh "${GITHUB_REF_NAME#v}"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          notes="docs/release-notes/$TAG.md"
+          if [ -f "$notes" ]; then
+            gh release create "$TAG" --title "$TAG" --notes-file "$notes" dist/*.zip
+          else
+            # No hand-written notes for this tag; fall back to the commit log
+            # rather than publishing something with an empty body.
+            gh release create "$TAG" --title "$TAG" --generate-notes dist/*.zip
+          fi
