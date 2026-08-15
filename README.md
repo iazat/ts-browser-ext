@@ -13,8 +13,6 @@ can keep work and personal tailnets fully separate.
 
 ## What this fork adds
 
-- ✅ **Working login on Chrome / macOS** — the original "Log in" link was a
-  dead anchor; it now opens the auth flow correctly.
 - 🔀 **Exit node picker** — choose a per-profile exit node right from the popup,
   or clear it. Routes only this browser profile through the exit node.
 - 🖥️ **Management page** at `http://100.100.100.100/` — device status, your
@@ -23,10 +21,34 @@ can keep work and personal tailnets fully separate.
 - ⏳ **Honest connection states** — "Connecting…" / "Waiting for approval…"
   while Tailscale brings the link up, instead of a scary error flash.
 - 🦊 **Firefox parity** — the `firefox/` copy carries the same popup, exit node
-  picker and proxy handling as the Chrome one, and no longer leaves a dead
-  `proxy.onRequest` handler installed after disconnect.
-- 🩹 Misc fixes: correct Chrome-vs-Firefox detection during install, the
-  missing `need-install` icon, and live popup refresh after login.
+  picker and proxy handling as the Chrome one.
+- 🔒 **No third-party requests** — the popup's font is bundled rather than
+  pulled from Google Fonts, so opening it reports to nobody and it still
+  renders correctly offline, which for a VPN extension is a state you end up
+  in on purpose.
+- 🧪 **Tests and CI** — both extensions have suites that run on every change,
+  alongside builds for six platforms.
+
+## Fixed here
+
+Most of these predate the fork:
+
+- **The connect toggle only worked once.** Turning the extension off left the
+  browser on a direct connection, and turning it back on never restored the
+  proxy — the only way back was reloading the extension.
+- **Firefox leaked a dead proxy handler** on every disconnect, pointing at a
+  port that was no longer listening, and stacked another one on every
+  reconnect.
+- **Login was a dead anchor on Chrome / macOS.** It opens the auth flow now.
+- **The exit node picker never hid itself**, leaving an empty dropdown on
+  screen whenever there was nothing to pick.
+- **The install command installed upstream's backend**, which has no exit node
+  support — so the picker never appeared and none of the proxy fixes were
+  there, with nothing on screen to explain why.
+- **The native binary did not compile for Windows at all**, because
+  `log/syslog` does not exist there.
+- Misc: Chrome-vs-Firefox detection during install, the missing
+  `need-install` icon, and live popup refresh after login.
 
 ## How it works
 
@@ -49,28 +71,53 @@ local and trusted).
 
 ## Status
 
-| Browser | OS      | Status                              |
-| ------- | ------- | ----------------------------------- |
-| Chrome  | macOS   | **Works**                           |
-| Chrome  | Linux   | Works in theory, untested           |
-| Chrome  | Windows | Registry install not yet done       |
-| Firefox | macOS   | Mostly works                        |
-| Firefox | Linux   | Mostly works in theory, untested    |
-| Firefox | Windows | Registry install not yet done       |
-| Safari  | \*      | Not possible (no Native Messaging)  |
+| Browser | OS      | Status                                          |
+| ------- | ------- | ----------------------------------------------- |
+| Chrome  | macOS   | **Works** — exercised before each release        |
+| Chrome  | Linux   | Should work; untested                            |
+| Chrome  | Windows | Backend builds, but cannot register itself       |
+| Firefox | macOS   | Passes its tests; not yet run in a real Firefox  |
+| Firefox | Linux   | Same, and the platform is untested too           |
+| Firefox | Windows | Backend builds, but cannot register itself       |
+| Safari  | \*      | Not possible (no Native Messaging)               |
 
 This is still **experimental** and aimed at developers, not end users.
 
+Two caveats worth stating plainly:
+
+**Firefox.** The `firefox/` copy was substantially rewritten to catch up with
+the Chrome one. It passes the same test suites and its popup is byte-identical,
+but no build of it has been loaded through `about:debugging` since that rework —
+and two of the bugs fixed in it were found by reading the code, not by the
+tests. Treat it as untried.
+
+**Windows.** The native binary compiles, but `--install` has no code path for
+it: registering a native messaging host on Windows means writing registry keys,
+and that is not implemented. Use macOS or Linux.
+
 ## Requirements
 
-- [Go](https://go.dev/dl/) (the version in [`go.mod`](go.mod) or newer) to build
-  and register the native backend.
-- Chrome or Firefox.
+- [Go](https://go.dev/dl/) (the version in [`go.mod`](go.mod) or newer). The
+  native backend is always built on your own machine, including when you
+  install the extension from a release.
+- Chrome or Firefox, on macOS or Linux.
+
+## Getting the extension files
+
+Either download a packaged build from
+[Releases](https://github.com/iazat/ts-browser-ext/releases) and unzip it —
+`ts-browser-ext-chrome-*.zip` or `ts-browser-ext-firefox-*.zip`, whichever
+browser you use — or clone this repository, whose root doubles as the Chrome
+extension directory with the Firefox one under `firefox/`.
+
+The release zips carry only what the browser needs. A clone also carries the
+Go sources, tests and CI config, which load harmlessly but are just noise.
 
 ## Install (Chrome)
 
 1. Open `chrome://extensions`, toggle **Developer mode** on.
-2. Click **Load unpacked** and select this repository's directory.
+2. Click **Load unpacked** and select the unzipped release directory, or this
+   repository's root.
 3. Pin the extension and click its icon.
 4. The popup prints the exact command to build and register the native
    backend. Copy it verbatim — it carries your extension's own ID, and the
@@ -86,8 +133,12 @@ This is still **experimental** and aimed at developers, not end users.
 
 ## Install (Firefox)
 
+Requires Firefox 109 or newer — the manifest is v3, which older builds do not
+support.
+
 1. Open `about:debugging#/runtime/this-firefox` → **Load Temporary Add-on…** and
-   pick `firefox/manifest.json`.
+   pick the `manifest.json` from the unzipped Firefox release, or
+   `firefox/manifest.json` in a clone.
 2. In `about:addons`, under the extension's **Run in Private Windows**, choose
    **Allow** if you want it active in private browsing.
 3. Pin the extension, click its icon, and run the printed
@@ -138,6 +189,42 @@ native-messaging integration still needs a real Firefox via
 
 If you have a Chromium that playwright didn't install, point at it with
 `CHROMIUM_PATH=/path/to/chromium npm test`.
+
+## Releases
+
+Tags are `vX.Y.Z` — Go requires the `v` and all three components to resolve
+`@latest`. The `version` field in the two manifests should be bumped to match
+before tagging. (`v1.1.0` shipped manifests reading `1.1`; both forms are valid
+to a browser, but keeping them identical avoids having to work out which build
+someone is running.)
+
+Pushing a tag runs [`.github/workflows/release.yml`](.github/workflows/release.yml),
+which re-runs the whole check suite — it does not assume the tagged commit went
+through a pull request, since a tag can be pushed anywhere — then packages both
+extensions and publishes a GitHub release with the zips attached. If a release
+for that tag already exists, it uploads into it and leaves the existing title
+and notes alone.
+
+Release notes come from `docs/release-notes/<tag>.md`, so write that file
+before tagging; without it the workflow falls back to a generated changelog.
+
+Cutting a release:
+
+1. Bump `version` in `manifest.json` and `firefox/manifest.json`.
+2. Add `docs/release-notes/vX.Y.Z.md`.
+3. Merge, then `git tag vX.Y.Z && git push origin vX.Y.Z`.
+
+To build the packages yourself:
+
+```sh
+script/package.sh          # version read from manifest.json
+```
+
+They land in `dist/`. The script lists the shipped files explicitly instead of
+filtering the repository, so a missing one fails the build rather than
+producing a half-working extension. The zips are not byte-reproducible — zip
+records file timestamps — so rebuilding gives a different checksum for
+identical contents.
 
 ## License
 
