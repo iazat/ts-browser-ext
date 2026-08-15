@@ -155,6 +155,12 @@
         text-decoration: underline;
       }
 
+      /* display:flex would otherwise beat the UA stylesheet's [hidden] rule,
+         leaving an empty picker on screen whenever renderExitNodes hides it. */
+      .exit-node[hidden] {
+        display: none;
+      }
+
       .exit-node {
         display: flex;
         flex-direction: column;
