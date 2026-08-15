@@ -110,7 +110,39 @@ This is still **experimental** and aimed at developers, not end users.
 go run . --uninstall
 ```
 
+## Tests
+
+The Go side:
+
+```sh
+go test ./...
+```
+
+The extensions, which are checked as two separate targets because Chrome and
+Firefox are maintained as separate copies of the same files:
+
+```sh
+npm ci
+npx playwright install chromium
+npm test
+```
+
+`tests/background.test.mjs` runs both background scripts against a mocked
+WebExtension API — proxy lifecycle, the commands the popup sends, and the
+messages that reach the native host. `tests/popup.test.mjs` renders both
+popups in Chromium and drives them through their states. The popup suite runs
+in Chromium even for the Firefox copy: the markup, CSS and `popup.js` logic
+are shared, so that is what it covers. Firefox's `proxy.onRequest` and
+native-messaging integration still needs a real Firefox via
+`about:debugging`.
+
+If you have a Chromium that playwright didn't install, point at it with
+`CHROMIUM_PATH=/path/to/chromium npm test`.
+
 ## License
 
 BSD 3-Clause — see [LICENSE](LICENSE). Original code © Tailscale Inc & AUTHORS;
 see [PATENTS](PATENTS).
+
+Bundled Inter font: SIL Open Font License 1.1 — see
+[fonts/LICENSE.txt](fonts/LICENSE.txt).

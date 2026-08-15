@@ -1,2 +1,5 @@
 /ts-browser-ext
 *.log
+
+# Extension test tooling
+node_modules/
