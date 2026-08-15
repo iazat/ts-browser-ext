@@ -22,7 +22,11 @@ files=(
   popup.js
 )
 
-rm -rf "$out"
+# Clear only what this script produces. dist/ is shared — script/screenshots.mjs
+# writes the store screenshots there too, and wiping the directory wholesale
+# deleted them.
+rm -rf "$out"/chrome "$out"/firefox
+rm -f "$out"/ts-browser-ext-*.zip
 mkdir -p "$out"
 
 package() {
