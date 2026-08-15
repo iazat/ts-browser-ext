@@ -4,10 +4,10 @@
   "version": "1.1",
   "description": "Give each browser profile its own Tailscale tailnet, using a local proxy from a companion app, without changing your system VPN settings.",
   "icons": {
-    "16": "icons/icon16.png",
-    "32": "icons/icon32.png",
-    "48": "icons/icon48.png",
-    "128": "icons/icon128.png"
+    "16": "icons/online-16.png",
+    "32": "icons/online-32.png",
+    "48": "icons/online-48.png",
+    "128": "icons/online-128.png"
   },
   "permissions": [
     "proxy",
@@ -24,10 +24,10 @@
   "action": {
     "default_popup": "popup.html",
     "default_icon": {
-      "16": "icons/icon16.png",
-      "32": "icons/icon32.png",
-      "48": "icons/icon48.png",
-      "128": "icons/icon128.png"
+      "16": "icons/online-16.png",
+      "32": "icons/online-32.png",
+      "48": "icons/online-48.png",
+      "128": "icons/online-128.png"
     }
   }
 }

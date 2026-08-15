@@ -169,6 +169,46 @@ for (const target of TARGETS) {
       );
     });
 
+    // setIcon reports a missing file through runtime.lastError, which the
+    // extension only logs — so renaming artwork breaks the toolbar icon with
+    // nothing visible but a console line. Check the files are really there.
+    test("every icon it asks the browser for exists on disk", async () => {
+      const fs = await import("node:fs");
+      const { sandbox, calls } = loadBackground(target.file, target.flavor);
+      const dir = path.dirname(target.file);
+
+      for (const state of ["online", "offline", "need-install"]) {
+        sandbox.setPopupIcon(state);
+      }
+      const referenced = new Set(
+        calls.icons.flatMap((p) => (typeof p === "string" ? [p] : Object.values(p)))
+      );
+      assert.ok(referenced.size > 0, "no icon was ever requested");
+
+      for (const rel of referenced) {
+        assert.ok(
+          fs.existsSync(path.join(dir, rel)),
+          `${target.name} asks for ${rel}, which is not in ${dir}`
+        );
+      }
+    });
+
+    test("the icons the manifest declares exist on disk", async () => {
+      const fs = await import("node:fs");
+      const dir = path.dirname(target.file);
+      const manifest = JSON.parse(fs.readFileSync(path.join(dir, "manifest.json"), "utf8"));
+
+      const declared = [
+        ...Object.values(manifest.icons ?? {}),
+        ...Object.values(manifest.action?.default_icon ?? {}),
+      ];
+      assert.ok(declared.length > 0, "the manifest declares no icons at all");
+
+      for (const rel of declared) {
+        assert.ok(fs.existsSync(path.join(dir, rel)), `manifest names ${rel}, which is missing`);
+      }
+    });
+
     test("shows the install prompt with its own browser byte", () => {
       const { calls } = loadBackground(target.file, target.flavor);
       // No native host has answered yet, so the port is still considered dead.

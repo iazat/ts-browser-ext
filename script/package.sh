@@ -20,10 +20,6 @@ files=(
   background.js
   popup.html
   popup.js
-  icon.png
-  online.png
-  offline.png
-  need-install.png
 )
 
 rm -rf "$out"

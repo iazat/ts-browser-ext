@@ -95,17 +95,22 @@ async function png(markup, size, out) {
   await page.close();
 }
 
+export const SIZES = [16, 32, 48, 128];
+
 for (const dir of [ROOT, path.join(ROOT, "firefox")]) {
   fs.mkdirSync(path.join(dir, "icons"), { recursive: true });
 
-  await png(svg(PALETTE.online, { simple: true }), 16, path.join(dir, "icons/icon16.png"));
-  for (const size of [32, 48, 128]) {
-    await png(svg(PALETTE.online), size, path.join(dir, `icons/icon${size}.png`));
-  }
-
-  await png(svg(PALETTE.online), 128, path.join(dir, "icon.png"));
+  // A full set per state. The browser draws the toolbar at 16 and picks the
+  // nearest size on offer, so handing it only a 128 leaves it downscaling
+  // artwork with nine elements in it — which is mush at that size.
   for (const [state, palette] of Object.entries(PALETTE)) {
-    await png(svg(palette), 128, path.join(dir, `${state}.png`));
+    for (const size of SIZES) {
+      await png(
+        svg(palette, { simple: size <= 16 }),
+        size,
+        path.join(dir, `icons/${state}-${size}.png`)
+      );
+    }
   }
 
   fs.writeFileSync(path.join(dir, "icons/icon.svg"), svg(PALETTE.online) + "\n");

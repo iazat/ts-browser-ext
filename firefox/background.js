@@ -6,11 +6,19 @@ function setPopupIcon(base) {
   if (typeof base === "boolean") {
     base = base ? "online" : "offline";
   }
-  let iconPath = base + ".png";
-  console.log("set icon path to: " + iconPath);
+  // Hand the browser the whole set rather than one file. The toolbar draws at
+  // 16px, and letting it downscale a 128px drawing with nine elements in it
+  // produces a smudge; the 16px artwork in the set is simplified for that.
+  const path = {
+    16: `icons/${base}-16.png`,
+    32: `icons/${base}-32.png`,
+    48: `icons/${base}-48.png`,
+    128: `icons/${base}-128.png`,
+  };
+  console.log("set icon to: " + base);
 
-  browser.action.setIcon({ path: iconPath }).catch((error) => {
-    console.error("Error setting icon to " + iconPath + ":", error.message);
+  browser.action.setIcon({ path }).catch((error) => {
+    console.error("Error setting icon to " + base + ":", error.message);
   });
 }
 
