@@ -72,16 +72,16 @@ This is still **experimental** and aimed at developers, not end users.
 1. Open `chrome://extensions`, toggle **Developer mode** on.
 2. Click **Load unpacked** and select this repository's directory.
 3. Pin the extension and click its icon.
-4. The popup prints a `go run … --install=C<extension-id>` command. From this
-   repo's directory, run it to build and register the native backend — using
-   `go run .` so it installs **your local copy**:
+4. The popup prints the exact command to build and register the native
+   backend. Copy it verbatim — it carries your extension's own ID, and the
+   `C` prefix means Chrome:
 
    ```sh
-   go run . --install=C<extension-id>
+   go run github.com/iazat/ts-browser-ext@latest --install=C<extension-id>
    ```
 
-   (Copy the exact `--install=C…` value from the popup; the `C` prefix means
-   Chrome.)
+   Working from a clone instead? Use `go run . --install=C<extension-id>` so
+   it registers **your local build** rather than the last release.
 5. Reload the extension, click the icon again, and select **Log in**.
 
 ## Install (Firefox)
@@ -91,7 +91,7 @@ This is still **experimental** and aimed at developers, not end users.
 2. In `about:addons`, under the extension's **Run in Private Windows**, choose
    **Allow** if you want it active in private browsing.
 3. Pin the extension, click its icon, and run the printed
-   `go run . --install=F…` command from this repo.
+   `--install=F…` command (or `go run . --install=F…` from a clone).
 4. Reload and select **Log in**.
 
 > Temporary add-ons are removed when Firefox restarts, so reload it from

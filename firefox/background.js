@@ -133,7 +133,7 @@ function sendPopupStatus() {
     console.log("sendPopupStatus... no nmPort");
     sendToPopup({
       installCmd:
-        "go run github.com/tailscale/ts-browser-ext@main --install=" +
+        "go run github.com/iazat/ts-browser-ext@latest --install=" +
         browserByte() +
         browser.runtime.id,
     });
