@@ -220,6 +220,17 @@ To build the packages yourself:
 script/package.sh          # version read from manifest.json
 ```
 
+Two more generators, both needing `npm ci` first:
+
+```sh
+npm run icons              # every icon, for both extensions, from one palette
+npm run screenshots        # store listing screenshots into dist/screenshots/
+```
+
+`npm run icons` also rewrites the mark embedded in both popups, so the artwork
+cannot drift between the files and the markup. Running it twice changes
+nothing.
+
 They land in `dist/`. The script lists the shipped files explicitly instead of
 filtering the repository, so a missing one fails the build rather than
 producing a half-working extension. The zips are not byte-reproducible — zip
@@ -233,3 +244,6 @@ see [PATENTS](PATENTS).
 
 Bundled Inter font: SIL Open Font License 1.1 — see
 [fonts/LICENSE.txt](fonts/LICENSE.txt).
+
+Privacy: [PRIVACY.md](PRIVACY.md). Notes for a Chrome Web Store submission:
+[docs/chrome-web-store.md](docs/chrome-web-store.md).

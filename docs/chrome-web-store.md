@@ -25,8 +25,17 @@ One caveat to weigh before submitting: `Tail-` is effectively Tailscale's own
 prefix (tailnet, tailscaled, Tailscale SSH), so "TailExt" still reads as a
 contraction of "Tailscale Extension". It is a much smaller problem than
 shipping their wordmark, but it is not zero — trademark questions turn on
-whether people are likely to assume an affiliation. Worth a search of the store
-and a trademark register before committing to it.
+whether people are likely to assume an affiliation.
+
+Two things found when checking, neither conclusive:
+
+- No extension named "TailExt" is listed in the store.
+- [Tailchrome](https://chromewebstore.google.com/detail/tailchrome/bhfeceecialgilpedkoflminjgcjljll)
+  is listed, does much the same thing, and carries the same prefix — so a
+  third-party Tailscale extension named `Tail…` has already passed review.
+  That is precedent, not permission.
+
+A trademark register has not been searched. Do that before the listing goes in.
 
 ## Single purpose
 
@@ -104,8 +113,10 @@ this — a reviewer who installs the extension and finds it inert will reject it
 
 ## Privacy policy
 
-The store requires a hosted URL. Publishing this file's section through GitHub
-Pages, or as a `PRIVACY.md` in the repository, satisfies it.
+The store requires a hosted URL. [`PRIVACY.md`](../PRIVACY.md) in the repository
+root serves as one — GitHub renders it at a stable address. The text below is
+kept here only so the reasoning behind each claim stays next to the rest of the
+submission notes; `PRIVACY.md` is the copy that gets linked.
 
 > **What this extension collects: nothing.**
 >
@@ -171,9 +182,9 @@ Pages, or as a `PRIVACY.md` in the repository, satisfies it.
 | --- | --- | --- |
 | Store icon | 128×128 PNG | `icons/icon128.png` |
 | Extension icons | 16/32/48/128 in `manifest.json` | declared |
-| Screenshots | at least one, 1280×800 or 640×400 | three captured, 1280×800 |
+| Screenshots | at least one, 1280×800 or 640×400 | `npm run screenshots` → `dist/screenshots/` |
 | Small promo tile | 440×280, optional | optional |
-| Privacy policy URL | must be publicly reachable | to be hosted |
+| Privacy policy URL | must be publicly reachable | [`PRIVACY.md`](../PRIVACY.md) |
 | Developer account | one-off 5 USD registration | account holder's step |
 
 ## Expect a slow review
