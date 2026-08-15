@@ -1,11 +1,14 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
-  <!-- Traffic entering a tunnel. Built to degrade gracefully: at 16px the
-       filled disc still reads as a solid silhouette and the arrow survives as
-       a notch, rather than dissolving into a blur the way an outlined ring
-       does. Deliberately unlike Tailscale's dot grid. -->
-  <rect width="128" height="128" rx="28" fill="#1F1E1E"/>
-  <circle cx="64" cy="64" r="42" fill="#FCFCFC"/>
-  <path d="M34 64 H74 M60 45 L82 64 L60 83"
-        fill="none" stroke="#3B63B8" stroke-width="15"
-        stroke-linecap="round" stroke-linejoin="round"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <rect width="1024" height="1024" rx="232" fill="#2B6BF5"/>
+  <g fill="#050505">
+    <circle cx="225" cy="222" r="106"/><circle cx="512" cy="222" r="106"/>
+    <circle cx="800" cy="222" r="106"/><circle cx="225" cy="800" r="106"/>
+    <circle cx="800" cy="800" r="106"/>
+  </g>
+  <g fill="#22EFFF" stroke="#22EFFF" stroke-width="24" stroke-linejoin="round"
+     >
+    <path d="M132 417 H352 L444 512 L352 607 H132 Z"/>
+    <path d="M892 417 H672 L580 512 L672 607 H892 Z"/>
+    <path d="M417 892 V672 L512 580 L607 672 V892 Z"/>
+  </g>
 </svg>
