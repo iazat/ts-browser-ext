@@ -44,7 +44,14 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           notes="docs/release-notes/$TAG.md"
-          if [ -f "$notes" ]; then
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # The release already exists — most likely written by hand while
+            # this job was still running its checks. Attach the artifacts to it
+            # rather than failing, and leave its title and notes alone:
+            # whoever wrote them meant them.
+            echo "Release $TAG already exists; uploading artifacts to it."
+            gh release upload "$TAG" dist/*.zip --clobber
+          elif [ -f "$notes" ]; then
             gh release create "$TAG" --title "$TAG" --notes-file "$notes" dist/*.zip
           else
             # No hand-written notes for this tag; fall back to the commit log
