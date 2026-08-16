@@ -6,6 +6,7 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"regexp"
 	"testing"
 )
 
@@ -56,6 +57,39 @@ func TestInstallRejectsBadChromeID(t *testing.T) {
 	} {
 		if err := install(arg); err == nil {
 			t.Errorf("install(%q) was accepted; expected it to be rejected", arg)
+		}
+	}
+}
+
+// TestHostNamesMatchExtensions ties the names in this file to the ones the
+// extensions actually ask for.
+//
+// Each background script calls connectNative with a literal string, and the
+// browser looks for a registration file named the same. Nothing in either
+// language references the other, so a rename touches one side and leaves the
+// other — and the failure is invisible: the extension installs, the popup
+// opens, the backend is never found. This is how the Firefox add-on id came
+// to disagree with its manifest.
+func TestHostNamesMatchExtensions(t *testing.T) {
+	for _, tt := range []struct {
+		file string
+		want string
+	}{
+		{"background.js", chromeHostName},
+		{"firefox/background.js", firefoxHostName},
+	} {
+		b, err := os.ReadFile(tt.file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := regexp.MustCompile(`connectNative\("([^"]+)"\)`).FindSubmatch(b)
+		if m == nil {
+			t.Errorf("%s: no connectNative call found", tt.file)
+			continue
+		}
+		if got := string(m[1]); got != tt.want {
+			t.Errorf("%s connects to %q, but the installer registers %q; "+
+				"the browser would never find the backend", tt.file, got, tt.want)
 		}
 	}
 }

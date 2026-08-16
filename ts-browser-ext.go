@@ -47,6 +47,32 @@ var (
 // TestFirefoxExtensionIDMatchesManifest keeps the two in step.
 const firefoxExtensionID = "tailext@iazat.github.io"
 
+// Native messaging host names. Each background script passes one of these to
+// connectNative, and the browser looks for a registration file of the same
+// name — so these strings and the ones in the extensions have to agree, or the
+// backend is simply never found. TestHostNamesMatchExtensions checks that.
+const (
+	chromeHostName  = "io.github.iazat.tailext.chrome"
+	firefoxHostName = "io.github.iazat.tailext.firefox"
+)
+
+// legacyHostNames are the registrations written before the extension was
+// renamed. They are removed on install and uninstall: left behind, they are a
+// file bearing someone else's name sitting in the user's browser config, and
+// a stale path to a binary this project no longer maintains.
+var legacyHostNames = []string{
+	"com.tailscale.browserext.chrome",
+	"com.tailscale.browserext.firefox",
+}
+
+// hostName returns the native messaging host name for a browser byte.
+func hostName(browserByte string) string {
+	if browserByte == "F" {
+		return firefoxHostName
+	}
+	return chromeHostName
+}
+
 func main() {
 	flag.Parse()
 	if *installFlag != "" {
@@ -137,15 +163,16 @@ func uninstall() error {
 			return err
 		}
 		targetBin := filepath.Join(targetDir, "ts-browser-ext")
-		targetJSON := filepath.Join(targetDir, "com.tailscale.browserext.chrome.json")
-		if browserByte == "F" {
-			targetJSON = filepath.Join(targetDir, "com.tailscale.browserext.firefox.json")
-		}
 		if err := os.Remove(targetBin); err != nil && !os.IsNotExist(err) {
 			return err
 		}
-		if err := os.Remove(targetJSON); err != nil && !os.IsNotExist(err) {
-			return err
+		// Both the current registration and anything an older version left.
+		names := append([]string{hostName(browserByte)}, legacyHostNames...)
+		for _, name := range names {
+			path := filepath.Join(targetDir, name+".json")
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				return err
+			}
 		}
 	}
 	return nil
@@ -188,27 +215,27 @@ func install(installArg string) error {
 
 	switch browserByte {
 	case "C":
-		targetJSON = filepath.Join(targetDir, "com.tailscale.browserext.chrome.json")
+		targetJSON = filepath.Join(targetDir, chromeHostName+".json")
 		jsonConf = fmt.Appendf(nil, `{
-		"name": "com.tailscale.browserext.chrome",
+		"name": "%s",
 		"description": "TailExt native backend",
 		"path": "%s",
 		"type": "stdio",
 		"allowed_origins": [
 			"chrome-extension://%s/"
 		]
-	  }`, targetBin, extension)
+	  }`, chromeHostName, targetBin, extension)
 	case "F":
-		targetJSON = filepath.Join(targetDir, "com.tailscale.browserext.firefox.json")
+		targetJSON = filepath.Join(targetDir, firefoxHostName+".json")
 		jsonConf = fmt.Appendf(nil, `{
-		"name": "com.tailscale.browserext.firefox",
+		"name": "%s",
 		"description": "TailExt native backend",
 		"path": "%s",
 		"type": "stdio",
 		"allowed_extensions": [
 			"%s"
 		]
-	  }`, targetBin, firefoxExtensionID)
+	  }`, firefoxHostName, targetBin, firefoxExtensionID)
 	default:
 		return fmt.Errorf("unknown browser prefix byte %q", browserByte)
 	}
@@ -216,6 +243,17 @@ func install(installArg string) error {
 		return err
 	}
 	log.Printf("wrote registration to %v", targetJSON)
+
+	// Clear registrations from before the rename, so the browser cannot find
+	// two hosts and so nothing is left pointing at a binary we no longer own.
+	for _, name := range legacyHostNames {
+		old := filepath.Join(targetDir, name+".json")
+		if err := os.Remove(old); err == nil {
+			log.Printf("removed stale registration %v", old)
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+	}
 	return nil
 }
 

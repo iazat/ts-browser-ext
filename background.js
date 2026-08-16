@@ -166,7 +166,7 @@ function connectToNativeHost() {
     return;
   }
   console.log("Connecting to native messaging host...");
-  nmPort = chrome.runtime.connectNative("com.tailscale.browserext.chrome");
+  nmPort = chrome.runtime.connectNative("io.github.iazat.tailext.chrome");
 
   nmPort.onDisconnect.addListener(() => {
     deadPort = true;
