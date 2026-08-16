@@ -214,3 +214,61 @@ func TestSafeToDial(t *testing.T) {
 		})
 	}
 }
+
+// None is a claim, not a placeholder: it says no exit node is configured. Two
+// startup states look the same to the code that builds the list and mean
+// nothing of the kind, and both used to be announced as None at the exact
+// moment the user is most likely to be looking.
+func TestExitNodeResolving(t *testing.T) {
+	const id = tailcfg.StableNodeID("nodeABC")
+	ip := netip.MustParseAddr("100.96.115.109")
+
+	for _, tt := range []struct {
+		name    string
+		prefsOK bool
+		prefID  tailcfg.StableNodeID
+		prefIP  netip.Addr
+		matched bool
+		want    bool
+		why     string
+	}{
+		{
+			name: "preferences could not be read",
+			want: true,
+			why:  "a failed read is not an answer of None",
+		},
+		{
+			name:    "configured by id, not in the peer list yet",
+			prefsOK: true,
+			prefID:  id,
+			want:    true,
+			why:     "the netmap is still arriving; the selection exists",
+		},
+		{
+			name:    "configured by ip, not in the peer list yet",
+			prefsOK: true,
+			prefIP:  ip,
+			want:    true,
+		},
+		{
+			name:    "configured and matched in the peer list",
+			prefsOK: true,
+			prefID:  id,
+			matched: true,
+			why:     "the picker can name it, so nothing is pending",
+		},
+		{
+			name:    "genuinely no exit node configured",
+			prefsOK: true,
+			why:     "this is the one case where None is true",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := exitNodeResolving(tt.prefsOK, tt.prefID, tt.prefIP, tt.matched)
+			if got != tt.want {
+				t.Errorf("exitNodeResolving(%v, %q, %v, %v) = %v, want %v: %s",
+					tt.prefsOK, tt.prefID, tt.prefIP, tt.matched, got, tt.want, tt.why)
+			}
+		})
+	}
+}

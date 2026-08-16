@@ -155,6 +155,35 @@ for (const target of TARGETS) {
       await page.close();
     });
 
+    // The backend reports exitNodeResolving when it has a selection it cannot
+    // name yet, which is what the first seconds after switching on look like.
+    // Rendering None there tells the user their exit node was forgotten.
+    test("says it is still working out the exit node rather than None", async () => {
+      const { page } = await open(target, {
+        status: { ...CONNECTED.status, exitNode: "", exitNodeResolving: true },
+      });
+      const opts = await page.$$eval("#exitNodeSelect option", (os) =>
+        os.map((o) => o.textContent)
+      );
+      assert.ok(
+        !opts.includes("None"),
+        `claimed no exit node is configured while still resolving: ${JSON.stringify(opts)}`
+      );
+      assert.deepEqual(opts, ["Connecting…"]);
+      assert.equal(
+        await page.$eval("#exitNodeSelect", (e) => e.disabled),
+        true,
+        "the picker must not accept a change while it cannot show the current value"
+      );
+      await page.close();
+    });
+
+    test("re-enables the picker once the exit node is known", async () => {
+      const { page } = await open(target, CONNECTED);
+      assert.equal(await page.$eval("#exitNodeSelect", (e) => e.disabled), false);
+      await page.close();
+    });
+
     test("hides the exit node picker when there is nothing to pick", async () => {
       const { page } = await open(target, { status: { running: false } });
       assert.equal(
