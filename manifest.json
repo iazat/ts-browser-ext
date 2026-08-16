@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "TailExt",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Give each browser profile its own Tailscale tailnet, using a local proxy from a companion app, without changing your system VPN settings.",
   "icons": {
     "16": "icons/online-16.png",

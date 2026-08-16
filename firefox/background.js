@@ -169,7 +169,7 @@ function connectToNativeHost() {
     return;
   }
   console.log("Connecting to native messaging host...");
-  nmPort = browser.runtime.connectNative("com.tailscale.browserext.firefox");
+  nmPort = browser.runtime.connectNative("io.github.iazat.tailext.firefox");
 
   nmPort.onDisconnect.addListener(() => {
     deadPort = true;

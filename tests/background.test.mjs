@@ -39,7 +39,7 @@ for (const target of TARGETS) {
   describe(`${target.name}: background.js`, () => {
     test("connects to its own native messaging host", () => {
       const { calls } = loadBackground(target.file, target.flavor);
-      assert.equal(calls.nativeHostName, `com.tailscale.browserext.${target.name}`);
+      assert.equal(calls.nativeHostName, `io.github.iazat.tailext.${target.name}`);
     });
 
     test("resets the browser proxy to direct when disabled", () => {

@@ -28,8 +28,10 @@ import (
 	"tailscale.com/client/tailscale"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/proxymux"
 	"tailscale.com/net/socks5"
+	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
@@ -46,6 +48,32 @@ var (
 // side: the extension installs, and the backend simply never answers.
 // TestFirefoxExtensionIDMatchesManifest keeps the two in step.
 const firefoxExtensionID = "tailext@iazat.github.io"
+
+// Native messaging host names. Each background script passes one of these to
+// connectNative, and the browser looks for a registration file of the same
+// name — so these strings and the ones in the extensions have to agree, or the
+// backend is simply never found. TestHostNamesMatchExtensions checks that.
+const (
+	chromeHostName  = "io.github.iazat.tailext.chrome"
+	firefoxHostName = "io.github.iazat.tailext.firefox"
+)
+
+// legacyHostNames are the registrations written before the extension was
+// renamed. They are removed on install and uninstall: left behind, they are a
+// file bearing someone else's name sitting in the user's browser config, and
+// a stale path to a binary this project no longer maintains.
+var legacyHostNames = []string{
+	"com.tailscale.browserext.chrome",
+	"com.tailscale.browserext.firefox",
+}
+
+// hostName returns the native messaging host name for a browser byte.
+func hostName(browserByte string) string {
+	if browserByte == "F" {
+		return firefoxHostName
+	}
+	return chromeHostName
+}
 
 func main() {
 	flag.Parse()
@@ -137,15 +165,16 @@ func uninstall() error {
 			return err
 		}
 		targetBin := filepath.Join(targetDir, "ts-browser-ext")
-		targetJSON := filepath.Join(targetDir, "com.tailscale.browserext.chrome.json")
-		if browserByte == "F" {
-			targetJSON = filepath.Join(targetDir, "com.tailscale.browserext.firefox.json")
-		}
 		if err := os.Remove(targetBin); err != nil && !os.IsNotExist(err) {
 			return err
 		}
-		if err := os.Remove(targetJSON); err != nil && !os.IsNotExist(err) {
-			return err
+		// Both the current registration and anything an older version left.
+		names := append([]string{hostName(browserByte)}, legacyHostNames...)
+		for _, name := range names {
+			path := filepath.Join(targetDir, name+".json")
+			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+				return err
+			}
 		}
 	}
 	return nil
@@ -188,27 +217,27 @@ func install(installArg string) error {
 
 	switch browserByte {
 	case "C":
-		targetJSON = filepath.Join(targetDir, "com.tailscale.browserext.chrome.json")
+		targetJSON = filepath.Join(targetDir, chromeHostName+".json")
 		jsonConf = fmt.Appendf(nil, `{
-		"name": "com.tailscale.browserext.chrome",
+		"name": "%s",
 		"description": "TailExt native backend",
 		"path": "%s",
 		"type": "stdio",
 		"allowed_origins": [
 			"chrome-extension://%s/"
 		]
-	  }`, targetBin, extension)
+	  }`, chromeHostName, targetBin, extension)
 	case "F":
-		targetJSON = filepath.Join(targetDir, "com.tailscale.browserext.firefox.json")
+		targetJSON = filepath.Join(targetDir, firefoxHostName+".json")
 		jsonConf = fmt.Appendf(nil, `{
-		"name": "com.tailscale.browserext.firefox",
+		"name": "%s",
 		"description": "TailExt native backend",
 		"path": "%s",
 		"type": "stdio",
 		"allowed_extensions": [
 			"%s"
 		]
-	  }`, targetBin, firefoxExtensionID)
+	  }`, firefoxHostName, targetBin, firefoxExtensionID)
 	default:
 		return fmt.Errorf("unknown browser prefix byte %q", browserByte)
 	}
@@ -216,6 +245,17 @@ func install(installArg string) error {
 		return err
 	}
 	log.Printf("wrote registration to %v", targetJSON)
+
+	// Clear registrations from before the rename, so the browser cannot find
+	// two hosts and so nothing is left pointing at a binary we no longer own.
+	for _, name := range legacyHostNames {
+		old := filepath.Join(targetDir, name+".json")
+		if err := os.Remove(old); err == nil {
+			log.Printf("removed stale registration %v", old)
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -369,6 +409,46 @@ func applyExitNode(ctx context.Context, lc *local.Client, name string) error {
 		return fmt.Errorf("EditPrefs exit node: %w", err)
 	}
 	return nil
+}
+
+// isConfiguredExitNode reports whether a peer is the exit node this profile is
+// set to use.
+//
+// ipnstate's ExitNode flag means "currently carrying this node's traffic",
+// which is a different question: it is false while the extension is switched
+// off, and for the first moments after it is switched on, before the route
+// comes up. Reading it alone makes the picker say None for a selection that is
+// still very much configured. The preferences are the answer — they survive
+// going down and coming back up.
+//
+// Which of ExitNodeID and ExitNodeIP is populated depends on how the node was
+// selected and on what the backend has since resolved, so both are checked.
+func isConfiguredExitNode(ps *ipnstate.PeerStatus, prefID tailcfg.StableNodeID, prefIP netip.Addr) bool {
+	if ps.ExitNode {
+		return true
+	}
+	if prefID != "" && ps.ID == prefID {
+		return true
+	}
+	if prefIP.IsValid() {
+		for _, ip := range ps.TailscaleIPs {
+			if ip == prefIP {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// configuredExitNode returns the exit node preferences, or zero values if they
+// cannot be read. A failure here only costs the picker its selection, so it is
+// not worth failing a status update over.
+func configuredExitNode(ctx context.Context, lc *local.Client) (tailcfg.StableNodeID, netip.Addr) {
+	prefs, err := lc.GetPrefs(ctx)
+	if err != nil {
+		return "", netip.Addr{}
+	}
+	return prefs.ExitNodeID, prefs.ExitNodeIP
 }
 
 // machineName returns the admin-panel machine name (first DNS label) for a
@@ -580,6 +660,7 @@ func (h *host) sendStatus() {
 		if lc, err := h.ts.LocalClient(); err == nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			if full, err := lc.Status(ctx); err == nil {
+				prefID, prefIP := configuredExitNode(ctx, lc)
 				for _, ps := range full.Peer {
 					if !ps.ExitNodeOption {
 						continue
@@ -588,12 +669,13 @@ func (h *host) sendStatus() {
 					if name == "" {
 						name = ps.HostName
 					}
+					selected := isConfiguredExitNode(ps, prefID, prefIP)
 					st.ExitNodes = append(st.ExitNodes, exitNodeInfo{
 						Name:     name,
 						Online:   ps.Online,
-						Selected: ps.ExitNode,
+						Selected: selected,
 					})
-					if ps.ExitNode {
+					if selected {
 						st.ExitNode = name
 					}
 				}
@@ -769,8 +851,9 @@ func (h *host) serveInternalData(w http.ResponseWriter, r *http.Request) {
 		d.SelfName = machineName(st.Self.DNSName, st.Self.HostName)
 		d.SelfIP = firstIP(st.Self.TailscaleIPs)
 	}
+	prefID, prefIP := configuredExitNode(r.Context(), lc)
 	for _, ps := range st.Peer {
-		if ps.ExitNode {
+		if isConfiguredExitNode(ps, prefID, prefIP) {
 			d.ExitNode = machineName(ps.DNSName, ps.HostName)
 		}
 		d.Peers = append(d.Peers, webPeer{
