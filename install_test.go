@@ -114,7 +114,7 @@ func TestIsConfiguredExitNode(t *testing.T) {
 	}{
 		{
 			// The case that made the picker read None: switched off, so nothing
-			// is routing, but theselection is still in the preferences.
+			// is routing, but the selection is still in the preferences.
 			name:   "configured by id while not routing",
 			peer:   &ipnstate.PeerStatus{ID: id},
 			prefID: id,

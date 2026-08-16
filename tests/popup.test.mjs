@@ -136,6 +136,25 @@ for (const target of TARGETS) {
       await page.close();
     });
 
+    test("names the tailnet it is connected to", async () => {
+      const { page } = await open(target, CONNECTED);
+      const text = (await page.textContent("#state")).trim();
+      assert.equal(text, "Connected as test@example.com");
+      await page.close();
+    });
+
+    // The backend can report running before it knows the tailnet name — it did
+    // exactly that when the netmap had not arrived yet — and the popup used to
+    // fill the gap with "Not connected", producing "Connected as Not
+    // connected" on a session that was in fact up and routing.
+    test("says plain Connected when the tailnet name is missing", async () => {
+      const { page } = await open(target, { status: { running: true, tailnet: "" } });
+      const text = (await page.textContent("#state")).trim();
+      assert.equal(text, "Connected");
+      assert.ok(!/Not connected/.test(text), `contradicts itself: ${JSON.stringify(text)}`);
+      await page.close();
+    });
+
     test("hides the exit node picker when there is nothing to pick", async () => {
       const { page } = await open(target, { status: { running: false } });
       assert.equal(

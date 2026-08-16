@@ -115,8 +115,12 @@ document.addEventListener("DOMContentLoaded", () => {
       return;
     }
     if (status.running !== undefined) {
+      // Never render "Connected as Not connected": if the backend is up but
+      // has not told us a tailnet name, plain "Connected" is the honest word.
       stateDisplay.textContent = status.running
-        ? `Connected as ${status.tailnet || "Not connected"}`
+        ? status.tailnet
+          ? `Connected as ${status.tailnet}`
+          : "Connected"
         : "Disconnected";
       isConnected = status.running;
       updateSliderState();
