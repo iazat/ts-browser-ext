@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"testing"
 
+	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 )
@@ -145,6 +146,70 @@ func TestIsConfiguredExitNode(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := isConfiguredExitNode(tt.peer, tt.prefID, tt.prefIP); got != tt.want {
 				t.Errorf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// The proxy is listening, and the browser has been pointed at it, before tsnet
+// finishes starting. Anything dialed in that window leaves through this
+// machine rather than the exit node — which is invisible afterwards, since the
+// backend is Running and reporting the right exit node by the time anyone
+// looks.
+func TestSafeToDial(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		state       ipn.State
+		exitNodeSet bool
+		want        bool
+		why         string
+	}{
+		{
+			name:        "starting with an exit node configured",
+			state:       ipn.Starting,
+			exitNodeSet: true,
+			why:         "this is the leak: the tailnet is not carrying traffic yet",
+		},
+		{
+			name:        "no state yet with an exit node configured",
+			state:       ipn.NoState,
+			exitNodeSet: true,
+			why:         "the backend has not reported anything; assume the worst",
+		},
+		{
+			name:        "stopped with an exit node configured",
+			state:       ipn.Stopped,
+			exitNodeSet: true,
+			why:         "nothing is routing, so nothing should leave",
+		},
+		{
+			name:        "running with an exit node configured",
+			state:       ipn.Running,
+			exitNodeSet: true,
+			want:        true,
+		},
+		{
+			name:        "needs login with an exit node configured",
+			state:       ipn.NeedsLogin,
+			exitNodeSet: true,
+			want:        true,
+			why:         "the login page is reached through this proxy; refusing locks the user out",
+		},
+		{
+			name:  "starting with no exit node",
+			state: ipn.Starting,
+			want:  true,
+			why:   "without an exit node, leaving through this machine is the point",
+		},
+		{
+			name:  "running with no exit node",
+			state: ipn.Running,
+			want:  true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := safeToDial(tt.state, tt.exitNodeSet); got != tt.want {
+				t.Errorf("safeToDial(%v, %v) = %v, want %v: %s", tt.state, tt.exitNodeSet, got, tt.want, tt.why)
 			}
 		})
 	}

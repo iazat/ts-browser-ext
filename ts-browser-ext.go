@@ -273,6 +273,11 @@ type host struct {
 	lastNetmap      *netmap.NetworkMap
 	lastState       ipn.State
 	lastBrowseToURL string
+	// exitNodeSet reports whether the preferences name an exit node. It
+	// starts true and is corrected by the first Prefs notification: until we
+	// know otherwise we must assume traffic is meant to leave through an exit
+	// node, because guessing the other way leaks the real address.
+	exitNodeSet bool
 	ctx             context.Context // for IPN bus; canceled by cancelCtx
 	cancelCtx       context.CancelFunc
 	ts              *tsnet.Server
@@ -283,9 +288,10 @@ type host struct {
 
 func newHost(r io.Reader, w io.Writer) *host {
 	h := &host{
-		br:   bufio.NewReaderSize(r, 1<<20),
-		w:    w,
-		logf: log.Printf,
+		br:          bufio.NewReaderSize(r, 1<<20),
+		w:           w,
+		logf:        log.Printf,
+		exitNodeSet: true, // assume the strict case until Prefs says otherwise
 	}
 	h.ts = &tsnet.Server{
 		RunWebClient: true,
@@ -527,7 +533,7 @@ func (h *host) handleInit(msg *request) (ret error) {
 	// when something about the tailnet happens to change, so a backend that
 	// comes up already logged in reports an empty tailnet name until then.
 	// It is not one of NotifyRateLimitIncompatibleBits, so it combines.
-	wc, err := lc.WatchIPNBus(h.ctx, ipn.NotifyInitialState|ipn.NotifyInitialNetMap|ipn.NotifyRateLimit)
+	wc, err := lc.WatchIPNBus(h.ctx, ipn.NotifyInitialState|ipn.NotifyInitialNetMap|ipn.NotifyInitialPrefs|ipn.NotifyRateLimit)
 	if err != nil {
 		return fmt.Errorf("watching IPN bus: %w", err)
 	}
@@ -565,6 +571,11 @@ func (h *host) updateFromWatcher(wc *tailscale.IPNBusWatcher) bool {
 	}
 	if n.State != nil {
 		h.lastState = *n.State
+	}
+
+	if n.Prefs != nil {
+		p := *n.Prefs
+		h.exitNodeSet = p.ExitNodeID() != "" || p.ExitNodeIP().IsValid()
 	}
 
 	if n.BrowseToURL != nil {
@@ -627,14 +638,48 @@ func (h *host) getProxyListenerLocked() net.Listener {
 	return h.ln
 }
 
+// safeToDial reports whether browser traffic may be sent out through tsnet
+// given the backend's current state.
+//
+// The proxy listener comes up and its port is announced to the extension
+// before tsnet has finished starting, so there is a window — seconds, on a
+// cold start — in which a dial succeeds but leaves through this machine's own
+// connection instead of the exit node. Nothing about that is visible
+// afterwards: by the time anyone looks, the backend is Running and reports
+// the exit node correctly. A page loaded in that window has already gone out
+// from the real address.
+//
+// Two states are allowed through deliberately:
+//
+// Without an exit node configured, leaving through this machine is what the
+// user asked for, not a leak.
+//
+// NeedsLogin is exempt because the browser is proxied through here: refusing
+// to dial while someone still has to reach the login page would lock them out
+// of the thing that fixes it. That state is at least loud — the popup says so
+// and the icon shows offline — unlike the silent startup window.
+func safeToDial(state ipn.State, exitNodeSet bool) bool {
+	if !exitNodeSet {
+		return true
+	}
+	return state == ipn.Running || state == ipn.NeedsLogin
+}
+
 func (h *host) userDial(ctx context.Context, netw, addr string) (net.Conn, error) {
 	h.mu.Lock()
 	sys := h.ts.Sys()
+	state := h.lastState
+	exitNodeSet := h.exitNodeSet
 	h.mu.Unlock()
 
 	if sys == nil {
 		h.logf("userDial to %v/%v without a tsnet.Server started", netw, addr)
 		return nil, fmt.Errorf("no tsnet.Server")
+	}
+
+	if !safeToDial(state, exitNodeSet) {
+		h.logf("userDial to %v/%v refused: exit node configured, backend in state %v", netw, addr, state)
+		return nil, fmt.Errorf("not routing yet: an exit node is configured but the tailnet is %v", state)
 	}
 
 	return sys.Dialer.Get().UserDial(ctx, netw, addr)
