@@ -523,7 +523,11 @@ func (h *host) handleInit(msg *request) (ret error) {
 		return fmt.Errorf("getting local client: %w", err)
 	}
 
-	wc, err := lc.WatchIPNBus(h.ctx, ipn.NotifyInitialState|ipn.NotifyRateLimit)
+	// NotifyInitialNetMap matters: without it the first netmap only arrives
+	// when something about the tailnet happens to change, so a backend that
+	// comes up already logged in reports an empty tailnet name until then.
+	// It is not one of NotifyRateLimitIncompatibleBits, so it combines.
+	wc, err := lc.WatchIPNBus(h.ctx, ipn.NotifyInitialState|ipn.NotifyInitialNetMap|ipn.NotifyRateLimit)
 	if err != nil {
 		return fmt.Errorf("watching IPN bus: %w", err)
 	}
@@ -660,6 +664,12 @@ func (h *host) sendStatus() {
 		if lc, err := h.ts.LocalClient(); err == nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			if full, err := lc.Status(ctx); err == nil {
+				// The management page reads the tailnet from here and got it
+				// right while the popup showed nothing, so trust this when
+				// the netmap has not given us a name.
+				if st.Tailnet == "" && full.CurrentTailnet != nil {
+					st.Tailnet = full.CurrentTailnet.Name
+				}
 				prefID, prefIP := configuredExitNode(ctx, lc)
 				for _, ps := range full.Peer {
 					if !ps.ExitNodeOption {
