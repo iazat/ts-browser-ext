@@ -46,9 +46,25 @@ package() {
   # checked against a local build. Flatten the timestamps and drop the extra
   # attribute blocks, and the archive becomes a function of its contents.
   find "$stage" -exec touch -t 198001010000 {} +
-  (cd "$stage" && zip -qrX "../ts-browser-ext-$name-v$version.zip" .)
+
+  # Feed zip a sorted list rather than letting -r walk the tree: it adds files
+  # in readdir order, which is a property of the filesystem, not of the
+  # contents. Two builds of the same tree on different machines produced
+  # archives holding byte-identical files in a different order — same size,
+  # every checksum different. That is how v1.2.2's published zip failed to
+  # match a local build of the same commit.
+  local zipfile="../ts-browser-ext-$name-v$version.zip"
+  (cd "$stage" && find . -type f | LC_ALL=C sort | zip -qX "$zipfile" -@)
   rm -rf "$stage"
-  echo "$out/ts-browser-ext-$name-v$version.zip"
+
+  # Check the property instead of trusting it. Ordering is what broke, and
+  # nothing else here would notice if it came back.
+  zipfile="$out/ts-browser-ext-$name-v$version.zip"
+  if ! diff -q <(unzip -Z1 "$zipfile") <(unzip -Z1 "$zipfile" | LC_ALL=C sort) >/dev/null; then
+    echo "$zipfile: entries are not in sorted order, so the archive is not reproducible" >&2
+    exit 1
+  fi
+  echo "$zipfile"
 }
 
 package chrome .
