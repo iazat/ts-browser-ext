@@ -41,7 +41,12 @@ package() {
   cp -r "$src/icons" "$stage/"
   cp LICENSE "$stage/"
 
-  (cd "$stage" && zip -qr "../ts-browser-ext-$name-v$version.zip" .)
+  # Zip records file timestamps, so an unmodified rebuild would otherwise
+  # produce a different checksum every time and a published asset could not be
+  # checked against a local build. Flatten the timestamps and drop the extra
+  # attribute blocks, and the archive becomes a function of its contents.
+  find "$stage" -exec touch -t 198001010000 {} +
+  (cd "$stage" && zip -qrX "../ts-browser-ext-$name-v$version.zip" .)
   rm -rf "$stage"
   echo "$out/ts-browser-ext-$name-v$version.zip"
 }
