@@ -5,9 +5,13 @@ package main
 
 import (
 	"encoding/json"
+	"net/netip"
 	"os"
 	"regexp"
 	"testing"
+
+	"tailscale.com/ipn/ipnstate"
+	"tailscale.com/tailcfg"
 )
 
 // TestFirefoxExtensionIDMatchesManifest guards a mismatch that fails silently.
@@ -91,5 +95,57 @@ func TestHostNamesMatchExtensions(t *testing.T) {
 			t.Errorf("%s connects to %q, but the installer registers %q; "+
 				"the browser would never find the backend", tt.file, got, tt.want)
 		}
+	}
+}
+
+// TestIsConfiguredExitNode covers the distinction the popup was getting wrong:
+// a node stays selected while it is not carrying traffic.
+func TestIsConfiguredExitNode(t *testing.T) {
+	const id = tailcfg.StableNodeID("nodeABC")
+	ip := netip.MustParseAddr("100.96.115.109")
+	other := netip.MustParseAddr("100.68.174.25")
+
+	for _, tt := range []struct {
+		name   string
+		peer   *ipnstate.PeerStatus
+		prefID tailcfg.StableNodeID
+		prefIP netip.Addr
+		want   bool
+	}{
+		{
+			// The case that made the picker read None: switched off, so nothing
+			// is routing, but theselection is still in the preferences.
+			name:   "configured by id while not routing",
+			peer:   &ipnstate.PeerStatus{ID: id},
+			prefID: id,
+			want:   true,
+		},
+		{
+			name:   "configured by ip while not routing",
+			peer:   &ipnstate.PeerStatus{TailscaleIPs: []netip.Addr{ip}},
+			prefIP: ip,
+			want:   true,
+		},
+		{
+			name: "actively routing, preferences unreadable",
+			peer: &ipnstate.PeerStatus{ExitNode: true},
+			want: true,
+		},
+		{
+			name:   "a different peer entirely",
+			peer:   &ipnstate.PeerStatus{ID: "somethingElse", TailscaleIPs: []netip.Addr{other}},
+			prefID: id,
+			prefIP: ip,
+		},
+		{
+			name: "no exit node configured at all",
+			peer: &ipnstate.PeerStatus{ID: id, TailscaleIPs: []netip.Addr{ip}},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isConfiguredExitNode(tt.peer, tt.prefID, tt.prefIP); got != tt.want {
+				t.Errorf("got %v, want %v", got, tt.want)
+			}
+		})
 	}
 }

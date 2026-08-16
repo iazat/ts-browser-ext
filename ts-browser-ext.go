@@ -28,8 +28,10 @@ import (
 	"tailscale.com/client/tailscale"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/proxymux"
 	"tailscale.com/net/socks5"
+	"tailscale.com/tailcfg"
 	"tailscale.com/tsnet"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
@@ -409,6 +411,46 @@ func applyExitNode(ctx context.Context, lc *local.Client, name string) error {
 	return nil
 }
 
+// isConfiguredExitNode reports whether a peer is the exit node this profile is
+// set to use.
+//
+// ipnstate's ExitNode flag means "currently carrying this node's traffic",
+// which is a different question: it is false while the extension is switched
+// off, and for the first moments after it is switched on, before the route
+// comes up. Reading it alone makes the picker say None for a selection that is
+// still very much configured. The preferences are the answer — they survive
+// going down and coming back up.
+//
+// Which of ExitNodeID and ExitNodeIP is populated depends on how the node was
+// selected and on what the backend has since resolved, so both are checked.
+func isConfiguredExitNode(ps *ipnstate.PeerStatus, prefID tailcfg.StableNodeID, prefIP netip.Addr) bool {
+	if ps.ExitNode {
+		return true
+	}
+	if prefID != "" && ps.ID == prefID {
+		return true
+	}
+	if prefIP.IsValid() {
+		for _, ip := range ps.TailscaleIPs {
+			if ip == prefIP {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// configuredExitNode returns the exit node preferences, or zero values if they
+// cannot be read. A failure here only costs the picker its selection, so it is
+// not worth failing a status update over.
+func configuredExitNode(ctx context.Context, lc *local.Client) (tailcfg.StableNodeID, netip.Addr) {
+	prefs, err := lc.GetPrefs(ctx)
+	if err != nil {
+		return "", netip.Addr{}
+	}
+	return prefs.ExitNodeID, prefs.ExitNodeIP
+}
+
 // machineName returns the admin-panel machine name (first DNS label) for a
 // peer, falling back to its hostname.
 func machineName(dnsName, hostName string) string {
@@ -618,6 +660,7 @@ func (h *host) sendStatus() {
 		if lc, err := h.ts.LocalClient(); err == nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			if full, err := lc.Status(ctx); err == nil {
+				prefID, prefIP := configuredExitNode(ctx, lc)
 				for _, ps := range full.Peer {
 					if !ps.ExitNodeOption {
 						continue
@@ -626,12 +669,13 @@ func (h *host) sendStatus() {
 					if name == "" {
 						name = ps.HostName
 					}
+					selected := isConfiguredExitNode(ps, prefID, prefIP)
 					st.ExitNodes = append(st.ExitNodes, exitNodeInfo{
 						Name:     name,
 						Online:   ps.Online,
-						Selected: ps.ExitNode,
+						Selected: selected,
 					})
-					if ps.ExitNode {
+					if selected {
 						st.ExitNode = name
 					}
 				}
@@ -807,8 +851,9 @@ func (h *host) serveInternalData(w http.ResponseWriter, r *http.Request) {
 		d.SelfName = machineName(st.Self.DNSName, st.Self.HostName)
 		d.SelfIP = firstIP(st.Self.TailscaleIPs)
 	}
+	prefID, prefIP := configuredExitNode(r.Context(), lc)
 	for _, ps := range st.Peer {
-		if ps.ExitNode {
+		if isConfiguredExitNode(ps, prefID, prefIP) {
 			d.ExitNode = machineName(ps.DNSName, ps.HostName)
 		}
 		d.Peers = append(d.Peers, webPeer{
