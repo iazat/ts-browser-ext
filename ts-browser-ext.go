@@ -278,11 +278,11 @@ type host struct {
 	// know otherwise we must assume traffic is meant to leave through an exit
 	// node, because guessing the other way leaks the real address.
 	exitNodeSet bool
-	ctx             context.Context // for IPN bus; canceled by cancelCtx
-	cancelCtx       context.CancelFunc
-	ts              *tsnet.Server
-	ln              net.Listener
-	wantUp          bool
+	ctx         context.Context // for IPN bus; canceled by cancelCtx
+	cancelCtx   context.CancelFunc
+	ts          *tsnet.Server
+	ln          net.Listener
+	wantUp      bool
 	// ...
 }
 
@@ -448,10 +448,23 @@ func isConfiguredExitNode(ps *ipnstate.PeerStatus, prefID tailcfg.StableNodeID, 
 
 // configuredExitNode returns the exit node preferences, or zero values if they
 // cannot be read. A failure here only costs the picker its selection, so it is
-// not worth failing a status update over.
-func configuredExitNode(ctx context.Context, lc *local.Client) (tailcfg.StableNodeID, netip.Addr) {
+// not worth failing a status update over — but it is worth saying out loud,
+// because a failure and "no exit node is set" are the same two return values
+// and the picker reads both as None.
+//
+// It takes its own deadline rather than inheriting the caller's. Sharing a
+// context with the Status call ahead of it meant that a slow Status — which is
+// exactly what happens just after a restart, while the peer list is being
+// built from a fresh netmap — left too little of it for this, and the
+// selection silently vanished from the picker at the one moment the user is
+// most likely to look.
+func configuredExitNode(lc *local.Client, logf logger.Logf) (tailcfg.StableNodeID, netip.Addr) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	prefs, err := lc.GetPrefs(ctx)
 	if err != nil {
+		logf("reading exit node preferences: %v; the picker will show None", err)
 		return "", netip.Addr{}
 	}
 	return prefs.ExitNodeID, prefs.ExitNodeIP
@@ -715,7 +728,7 @@ func (h *host) sendStatus() {
 				if st.Tailnet == "" && full.CurrentTailnet != nil {
 					st.Tailnet = full.CurrentTailnet.Name
 				}
-				prefID, prefIP := configuredExitNode(ctx, lc)
+				prefID, prefIP := configuredExitNode(lc, h.logf)
 				for _, ps := range full.Peer {
 					if !ps.ExitNodeOption {
 						continue
@@ -906,7 +919,7 @@ func (h *host) serveInternalData(w http.ResponseWriter, r *http.Request) {
 		d.SelfName = machineName(st.Self.DNSName, st.Self.HostName)
 		d.SelfIP = firstIP(st.Self.TailscaleIPs)
 	}
-	prefID, prefIP := configuredExitNode(r.Context(), lc)
+	prefID, prefIP := configuredExitNode(lc, h.logf)
 	for _, ps := range st.Peer {
 		if isConfiguredExitNode(ps, prefID, prefIP) {
 			d.ExitNode = machineName(ps.DNSName, ps.HostName)
