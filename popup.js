@@ -21,6 +21,16 @@ document.addEventListener("DOMContentLoaded", () => {
       return;
     }
     exitNodeRow.hidden = false;
+    // None is a claim that no exit node is configured. Just after switching
+    // on, the backend can have a selection it cannot name yet — the netmap is
+    // still arriving. Saying None there is simply false, and it is the moment
+    // the popup is most likely to be open.
+    if (status.exitNodeResolving) {
+      exitNodeSelect.innerHTML = `<option selected>Connecting…</option>`;
+      exitNodeSelect.disabled = true;
+      return;
+    }
+    exitNodeSelect.disabled = false;
     const selected = status.exitNode || "";
     let html = `<option value=""${selected ? "" : " selected"}>None</option>`;
     for (const n of nodes) {

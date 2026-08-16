@@ -458,16 +458,43 @@ func isConfiguredExitNode(ps *ipnstate.PeerStatus, prefID tailcfg.StableNodeID, 
 // built from a fresh netmap — left too little of it for this, and the
 // selection silently vanished from the picker at the one moment the user is
 // most likely to look.
-func configuredExitNode(lc *local.Client, logf logger.Logf) (tailcfg.StableNodeID, netip.Addr) {
+// The final return reports whether the preferences were read at all. Without
+// it a failure is indistinguishable from an answer of "none configured", which
+// is what let the picker state something false with no way to notice.
+func configuredExitNode(lc *local.Client, logf logger.Logf) (tailcfg.StableNodeID, netip.Addr, bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	prefs, err := lc.GetPrefs(ctx)
 	if err != nil {
-		logf("reading exit node preferences: %v; the picker will show None", err)
-		return "", netip.Addr{}
+		logf("reading exit node preferences: %v", err)
+		return "", netip.Addr{}, false
 	}
-	return prefs.ExitNodeID, prefs.ExitNodeIP
+	return prefs.ExitNodeID, prefs.ExitNodeIP, true
+}
+
+// exitNodeResolving reports whether the picker should say it does not know yet
+// rather than None.
+//
+// None is a claim: it says no exit node is configured. Two states at startup
+// look identical to the code that builds the list but mean nothing of the
+// kind. The preferences may not have been read — the previous version of this
+// returned zero values for that and the picker announced None. Or they were
+// read and name a node that has not appeared in the peer list yet, because the
+// netmap is still arriving, so nothing in the loop matches and again the
+// picker announces None.
+//
+// Both settle within seconds. Neither is None. Saying so at the moment the
+// user is most likely to be looking — right after switching on — is how the
+// picker came to be distrusted in the first place.
+func exitNodeResolving(prefsOK bool, prefID tailcfg.StableNodeID, prefIP netip.Addr, matched bool) bool {
+	if !prefsOK {
+		return true
+	}
+	if matched {
+		return false
+	}
+	return prefID != "" || prefIP.IsValid()
 }
 
 // machineName returns the admin-panel machine name (first DNS label) for a
@@ -728,7 +755,7 @@ func (h *host) sendStatus() {
 				if st.Tailnet == "" && full.CurrentTailnet != nil {
 					st.Tailnet = full.CurrentTailnet.Name
 				}
-				prefID, prefIP := configuredExitNode(lc, h.logf)
+				prefID, prefIP, prefsOK := configuredExitNode(lc, h.logf)
 				for _, ps := range full.Peer {
 					if !ps.ExitNodeOption {
 						continue
@@ -750,6 +777,7 @@ func (h *host) sendStatus() {
 				sort.Slice(st.ExitNodes, func(i, j int) bool {
 					return st.ExitNodes[i].Name < st.ExitNodes[j].Name
 				})
+				st.ExitNodeResolving = exitNodeResolving(prefsOK, prefID, prefIP, st.ExitNode != "")
 			}
 			cancel()
 		}
@@ -823,6 +851,11 @@ type status struct {
 
 	ExitNode  string         `json:"exitNode,omitempty"`  // name of the currently selected exit node, if any
 	ExitNodes []exitNodeInfo `json:"exitNodes,omitempty"` // exit nodes available to pick from
+
+	// ExitNodeResolving means the selection is not known yet, as opposed to
+	// being empty. The picker must not say None while this is set: see
+	// [exitNodeResolving].
+	ExitNodeResolving bool `json:"exitNodeResolving,omitempty"`
 }
 
 type exitNodeInfo struct {
@@ -919,7 +952,7 @@ func (h *host) serveInternalData(w http.ResponseWriter, r *http.Request) {
 		d.SelfName = machineName(st.Self.DNSName, st.Self.HostName)
 		d.SelfIP = firstIP(st.Self.TailscaleIPs)
 	}
-	prefID, prefIP := configuredExitNode(lc, h.logf)
+	prefID, prefIP, _ := configuredExitNode(lc, h.logf)
 	for _, ps := range st.Peer {
 		if isConfiguredExitNode(ps, prefID, prefIP) {
 			d.ExitNode = machineName(ps.DNSName, ps.HostName)
