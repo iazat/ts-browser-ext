@@ -19,7 +19,9 @@ function respond(cb, value) {
 // sandbox plus a record of everything the script did to the browser.
 //
 // `flavor` picks which global the script expects: "chrome" or "browser".
-export function loadBackground(file, flavor) {
+// `extraGlobals` adds to the sandbox, so a test can hand the script an
+// environment that lies about which browser it is running in.
+export function loadBackground(file, flavor, extraGlobals = {}) {
   const calls = {
     proxyListeners: [], // handlers currently registered on proxy.onRequest
     removeMisses: 0, //    removeListener calls that matched no handler
@@ -82,6 +84,7 @@ export function loadBackground(file, flavor) {
     crypto: { randomUUID: () => "test-uuid" },
     URL,
     Promise,
+    ...extraGlobals,
   };
   vm.createContext(sandbox);
   vm.runInContext(fs.readFileSync(file, "utf8"), sandbox, { filename: file });

@@ -117,13 +117,17 @@ browser.runtime.onConnect.addListener((port) => {
   }
 });
 
-// browserByte returns either "F" for Firefox or "C" for chrome.
-// Other browsers return "?".
+// browserByte returns the prefix the backend's --install flag takes for this
+// browser: "F" here, and "C" in the Chrome copy of this file.
+//
+// The two extensions are separate copies, so which browser this one runs in is
+// settled when the file is written. Asking the environment instead is what used
+// to get it wrong: Chrome now defines `browser` as well, and a user agent can
+// claim anything. A wrong byte prints a command that registers the native host
+// for the browser that is not running, and the popup keeps asking for an
+// install that was just done.
 function browserByte() {
-  if (typeof browser !== "undefined") {
-    return "F";
-  }
-  return "?";
+  return "F";
 }
 
 function sendPopupStatus() {
