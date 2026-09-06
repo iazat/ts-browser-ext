@@ -223,6 +223,39 @@ for (const target of TARGETS) {
       );
     });
 
+    // The byte is a property of the file, not of the machine it runs on. Both
+    // copies used to work it out at runtime, and both signals have since gone
+    // soft: Chrome defines `browser` too, and a user agent is whatever the
+    // browser, an extension or the user says it is. Getting it wrong prints a
+    // command that registers the native host under the other browser's name,
+    // after which the popup still asks to install it.
+    test("names its own browser whatever the environment claims", () => {
+      const otherGlobal = target.name === "chrome" ? "browser" : "chrome";
+      const otherAgent =
+        target.name === "chrome"
+          ? "Mozilla/5.0 (X11; Linux x86_64; rv:143.0) Gecko/20100101 Firefox/143.0"
+          : "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+            "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
+
+      const { calls } = loadBackground(target.file, target.flavor, {
+        [otherGlobal]: {},
+        navigator: { userAgent: otherAgent },
+      });
+      connectPopup(calls);
+
+      const { installCmd } = calls.toPopup.find((m) => m.installCmd);
+      const expected = target.name === "chrome" ? "--install=C" : "--install=F";
+      const wrong = target.name === "chrome" ? "--install=F" : "--install=C";
+      assert.ok(
+        installCmd.includes(expected),
+        `expected ${expected} in ${JSON.stringify(installCmd)}`
+      );
+      assert.ok(
+        !installCmd.includes(wrong),
+        `the ${target.name} copy read its browser off the environment: ${JSON.stringify(installCmd)}`
+      );
+    });
+
     // This fork's native host understands set-exit-node and reports exitNodes;
     // upstream's does not. Pointing people at the wrong module hands them a
     // host that half-works, with no hint as to why, so pin it to this repo.

@@ -233,9 +233,11 @@ nothing.
 
 They land in `dist/`. The script lists the shipped files explicitly instead of
 filtering the repository, so a missing one fails the build rather than
-producing a half-working extension. The zips are not byte-reproducible — zip
-records file timestamps — so rebuilding gives a different checksum for
-identical contents.
+producing a half-working extension. The zips are byte-reproducible: timestamps
+are flattened, the extra attribute blocks dropped, and the entries sorted, so
+a build of a tagged commit has the same checksum as the asset published for
+that tag — on any machine, not just the one that built it twice. The script
+checks the ordering and fails rather than publishing an archive that lost it.
 
 ## License
 
