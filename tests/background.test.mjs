@@ -550,6 +550,32 @@ for (const target of TARGETS) {
       });
     });
 
+    // The backend reports a failed start in procRunning.error and a failed
+    // init in init.error. Both branches used to read a field that has never
+    // existed — "errror", and "err" — so the first never ran at all and the
+    // second logged "undefined" in place of the reason.
+    test("acts on a backend that reports it could not start", () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      bringUp(calls);
+      assert.ok(target.isProxied(calls), "expected to be proxied to begin with");
+
+      calls.onNativeMessage({ procRunning: { error: "listen tcp 127.0.0.1:0: too many open files" } });
+
+      assert.ok(
+        !target.isProxied(calls),
+        "left the browser routed through a backend that says it never came up"
+      );
+    });
+
+    test("acts on a backend that reports a failed init", () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      bringUp(calls);
+
+      calls.onNativeMessage({ init: { error: "starting tsnet.Server: permission denied" } });
+
+      assert.ok(!target.isProxied(calls), "left the browser routed into a tailnet that never started");
+    });
+
     // This fork's native host understands set-exit-node and reports exitNodes;
     // upstream's does not. Pointing people at the wrong module hands them a
     // host that half-works, with no hint as to why, so pin it to this repo.

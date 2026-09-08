@@ -358,15 +358,15 @@ function connectToNativeHost() {
         if (proxyWanted === true) {
           setProxy(message.procRunning.port);
         }
-      } else if (message.procRunning.errror) {
+      } else if (message.procRunning.error) {
         console.log(
-          "procRunning error from backend: " + message.procRunning.err
+          "procRunning error from backend: " + message.procRunning.error
         );
         disableProxy();
       }
     }
     if (message.init && message.init.error) {
-      console.log("init error from backend: " + message.init.err);
+      console.log("init error from backend: " + message.init.error);
       disableProxy();
     }
     if (message.status) {
