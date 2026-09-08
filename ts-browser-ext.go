@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -288,6 +289,10 @@ type host struct {
 	// watch is re-established. They are fields rather than constants so the
 	// tests do not have to sit through a real backoff.
 	watchRetryMin, watchRetryMax time.Duration
+
+	// lastSentStatus is the status last written to the extension, encoded. It
+	// is what [host.sendStatus] compares against to avoid repeating itself.
+	lastSentStatus []byte
 }
 
 func newHost(r io.Reader, w io.Writer) *host {
@@ -330,7 +335,7 @@ func (h *host) handleMessage(msg *request) error {
 	case CmdInit:
 		return h.handleInit(msg)
 	case CmdGetStatus:
-		h.sendStatus()
+		h.answerStatus()
 	case CmdUp:
 		return h.handleUp()
 	case CmdDown:
@@ -352,7 +357,7 @@ func (h *host) handleDown() error {
 }
 
 func (h *host) setWantRunning(want bool) error {
-	defer h.sendStatus()
+	defer h.answerStatus()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.ts.Sys() == nil {
@@ -381,7 +386,7 @@ func (h *host) setWantRunning(want bool) error {
 // this profile. The name is an IP or a peer hostname/FQDN, resolved against
 // the current status the same way `tailscale set --exit-node` does.
 func (h *host) handleSetExitNode(msg *request) error {
-	defer h.sendStatus()
+	defer h.answerStatus()
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.ts.Sys() == nil {
@@ -788,7 +793,23 @@ func (h *host) userDial(ctx context.Context, netw, addr string) (net.Conn, error
 	return sys.Dialer.Get().UserDial(ctx, netw, addr)
 }
 
-func (h *host) sendStatus() {
+// sendStatus tells the extension where things stand, unless nothing has moved
+// since the last time it was told.
+//
+// The IPN bus produces a notification for anything that happens on the
+// tailnet, and a tailnet of any size is never quiet: peers come and go, the
+// netmap is reissued, and each one arrived here as a status identical to the
+// one before it. Every repeat cost this process two round-trips to its own
+// backend to rebuild the peer list, and cost the extension a redraw of the
+// toolbar icon — the same button the user is trying to click.
+func (h *host) sendStatus() { h.emitStatus(false) }
+
+// answerStatus is sendStatus for the callers that are answering something. A
+// request deserves a reply even when the answer has not changed since the
+// last one.
+func (h *host) answerStatus() { h.emitStatus(true) }
+
+func (h *host) emitStatus(force bool) {
 	st := &status{}
 	h.mu.Lock()
 	st.Running = h.lastState == ipn.Running
@@ -843,6 +864,16 @@ func (h *host) sendStatus() {
 				st.ExitNodeResolving = exitNodeResolving(prefsOK, prefID, prefIP, st.ExitNode != "")
 			}
 			cancel()
+		}
+	}
+
+	if b, err := json.Marshal(st); err == nil {
+		h.mu.Lock()
+		repeat := !force && bytes.Equal(b, h.lastSentStatus)
+		h.lastSentStatus = b
+		h.mu.Unlock()
+		if repeat {
+			return
 		}
 	}
 

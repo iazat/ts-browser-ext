@@ -2,10 +2,16 @@ let proxyEnabled = false;
 
 // setPopupIcon sets the icon. It takes either a boolean (for online/offline)
 // or the base name of the png file.
+let lastIconBase = null;
+
 function setPopupIcon(base) {
   if (typeof base === "boolean") {
     base = base ? "online" : "offline";
   }
+  if (base === lastIconBase) {
+    return; // the toolbar is already showing it
+  }
+  lastIconBase = base;
   // Hand the browser the whole set rather than one file. The toolbar draws at
   // 16px, and letting it downscale a 128px drawing with nine elements in it
   // produces a smudge; the 16px artwork in the set is simplified for that.
@@ -279,6 +285,44 @@ function rememberHostSeen() {
 const connectStallMs = 5000;
 let connectingSince = 0;
 
+// Keepalive for the worker this script runs in.
+//
+// The browser discards an idle worker after about thirty seconds, and the
+// native host is its child: the backend dies with it, so the next click pays
+// for a whole new process starting Tailscale from cold — seconds of a popup
+// that just spins. Traffic in a message resets that idle timer, so while a
+// backend is connected we ask it for a status well inside the window. The
+// reply is what actually keeps the worker alive; the question is only how to
+// provoke one, and a status refreshes what the popup will show anyway.
+//
+// This is a deliberate trade: a resident worker for as long as the backend is
+// up. That backend is a running process holding the tailnet either way, and
+// the alternative is a VPN that has to be restarted every time it is looked
+// at.
+const keepaliveMs = 20000;
+let keepaliveTimer = null;
+
+function scheduleKeepalive() {
+  if (keepaliveTimer !== null || deadPort) {
+    return;
+  }
+  keepaliveTimer = setTimeout(() => {
+    keepaliveTimer = null;
+    if (deadPort || !nmPort) {
+      return;
+    }
+    nmPort.postMessage({ cmd: "get-status" });
+    scheduleKeepalive();
+  }, keepaliveMs);
+}
+
+function stopKeepalive() {
+  if (keepaliveTimer !== null) {
+    clearTimeout(keepaliveTimer);
+    keepaliveTimer = null;
+  }
+}
+
 function scheduleReconnect() {
   if (retryTimer !== null) {
     return; // an attempt is already pending
@@ -324,6 +368,7 @@ function connectToNativeHost() {
   nmPort.onDisconnect.addListener(() => {
     deadPort = true;
     connectingSince = 0;
+    stopKeepalive();
     nativeProxyPort = 0; // the host is gone, and so is the port it was listening on
     // The next host is a new process with no tsnet running in it, so it needs
     // the init this one already had. Leaving this set made reconnecting worse
@@ -358,6 +403,7 @@ function connectToNativeHost() {
     retryDelayMs = retryMinMs;
     failedConnects = 0;
     rememberHostSeen();
+    scheduleKeepalive();
     if (message.procRunning) {
       if (message.procRunning.port) {
         nativeProxyPort = message.procRunning.port;

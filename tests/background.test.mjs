@@ -182,6 +182,35 @@ for (const target of TARGETS) {
       );
     });
 
+    // The backend sends a status per notification and a live tailnet is never
+    // quiet. Each one had the browser fetch and decode four PNGs for a toolbar
+    // icon that already looked exactly like that — work landing on the button
+    // the user is reaching for.
+    test("does not redraw an icon the toolbar is already showing", () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      bringUp(calls);
+      const before = calls.icons.length;
+
+      for (let i = 0; i < 5; i++) {
+        calls.onNativeMessage({ status: { running: true, tailnet: "test@example.com" } });
+      }
+
+      assert.equal(calls.icons.length, before, "redrew an unchanged icon on every status");
+    });
+
+    test("still redraws when the icon actually changes", () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      bringUp(calls);
+      const before = calls.icons.length;
+
+      calls.onNativeMessage({ status: { running: false, error: "State: Stopped" } });
+
+      assert.ok(
+        calls.icons.length > before,
+        "the toolbar was left showing online for a tailnet that is switched off"
+      );
+    });
+
     // setIcon reports a missing file through runtime.lastError, which the
     // extension only logs — so renaming artwork breaks the toolbar icon with
     // nothing visible but a console line. Check the files are really there.
@@ -466,6 +495,40 @@ for (const target of TARGETS) {
         assert.ok(
           calls.toPopup.some((m) => m.reconnecting),
           "a fresh worker forgot the backend was installed and asked for it to be installed again"
+        );
+      });
+
+      // The browser discards an idle worker in about thirty seconds and the
+      // native host, its child, dies with it — so the next click pays for a
+      // process starting Tailscale from cold. Messages reset that timer.
+      test("keeps its worker alive while a backend is connected", () => {
+        const { calls } = loadBackground(target.file, target.flavor);
+        bringUp(calls);
+        calls.toNativeHost.length = 0;
+
+        runTimers(calls); // the keepalive comes due
+
+        assert.ok(
+          calls.toNativeHost.some((m) => m.cmd === "get-status"),
+          "nothing was sent to hold the worker open, so the browser is free to discard it"
+        );
+        assert.ok(
+          calls.timers.filter(Boolean).length > 0,
+          "the keepalive fired once and never re-armed"
+        );
+      });
+
+      test("stops holding the worker open once the backend is gone", () => {
+        const { calls } = loadBackground(target.file, target.flavor);
+        bringUp(calls);
+        calls.onNativeDisconnect();
+        calls.toNativeHost.length = 0;
+
+        runTimers(calls);
+
+        assert.ok(
+          !calls.toNativeHost.some((m) => m.cmd === "get-status"),
+          "kept talking to a port that is not there"
         );
       });
 

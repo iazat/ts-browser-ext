@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"strings"
@@ -156,5 +158,59 @@ func TestWatchBusSurvivesABrokenWatch(t *testing.T) {
 	}
 	if !replacement.isClosed() {
 		t.Error("the replacement watch was left open when the loop stopped")
+	}
+}
+
+// frames reads the length-prefixed messages written to the extension.
+func frames(t *testing.T, b *bytes.Buffer) []string {
+	t.Helper()
+	var out []string
+	for b.Len() > 0 {
+		var lenBuf [4]byte
+		if _, err := io.ReadFull(b, lenBuf[:]); err != nil {
+			t.Fatalf("reading frame length: %v", err)
+		}
+		msg := make([]byte, binary.LittleEndian.Uint32(lenBuf[:]))
+		if _, err := io.ReadFull(b, msg); err != nil {
+			t.Fatalf("reading frame body: %v", err)
+		}
+		out = append(out, string(msg))
+	}
+	return out
+}
+
+// TestSendStatusSkipsRepeats keeps a quiet tailnet quiet on the wire.
+//
+// The IPN bus fires for anything that happens out there, and most of it does
+// not change a word of what the extension is shown. Each repeat cost two
+// round-trips to this process's own backend for the peer list, and cost the
+// extension a redraw of the toolbar icon — the button the user is reaching
+// for. What a request asks for is still always answered.
+func TestSendStatusSkipsRepeats(t *testing.T) {
+	var buf bytes.Buffer
+	h := newHost(strings.NewReader(""), &buf)
+	h.logf = t.Logf
+
+	h.lastState = ipn.Running
+	h.sendStatus()
+	h.sendStatus()
+	h.sendStatus()
+	if got := frames(t, &buf); len(got) != 1 {
+		t.Fatalf("sent %d statuses for one unchanged state, want 1: %q", len(got), got)
+	}
+
+	h.lastState = ipn.Stopped
+	h.sendStatus()
+	got := frames(t, &buf)
+	if len(got) != 1 {
+		t.Fatalf("sent %d statuses for a state that did change, want 1: %q", len(got), got)
+	}
+	if !strings.Contains(got[0], "Stopped") {
+		t.Errorf("status does not carry the new state: %q", got[0])
+	}
+
+	h.answerStatus()
+	if got := frames(t, &buf); len(got) != 1 {
+		t.Errorf("a request went unanswered because the answer had not changed: %q", got)
 	}
 }
