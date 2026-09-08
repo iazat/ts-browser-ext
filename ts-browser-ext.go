@@ -325,7 +325,20 @@ func (h *host) readMessages() error {
 		}
 		if err := h.handleMessage(msg); err != nil {
 			h.logf("error handling message %v: %v", msg, err)
-			return err
+			if msg.Cmd == CmdInit {
+				// An init that failed leaves a process with no tailnet in it,
+				// and nothing here can start one: the extension only sends
+				// init once per connection. Ending the loop drops the port,
+				// which is what makes the extension throw this process away
+				// and try again with a new one.
+				return err
+			}
+			// Everything else is one command that did not work — an exit node
+			// picked before the netmap arrived, a toggle that raced the
+			// startup. Ending the process over it took the whole tailnet down
+			// and cost a cold tsnet start, for a click that could simply be
+			// reported as not having worked. Both handlers answer with a
+			// status of their own, so the popup is not left guessing.
 		}
 	}
 }
@@ -703,10 +716,17 @@ func (h *host) send(msg *reply) error {
 	if len(msgb) > maxMsgSize {
 		return fmt.Errorf("message too big (%v)", len(msgb))
 	}
-	binary.LittleEndian.PutUint32(h.lenBuf[:], uint32(len(msgb)))
+	// Not h.lenBuf: that one belongs to readMessage, which is parked in a read
+	// into it almost all the time. Sharing it let an outgoing length be
+	// overwritten by an incoming one — or by another sender, now that both the
+	// bus watcher and the message loop reply — after which the browser reads
+	// one message's length and another message's body, and the stream is
+	// desynchronised for good.
+	var lenBuf [4]byte
+	binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(msgb)))
 	h.wmu.Lock()
 	defer h.wmu.Unlock()
-	if _, err := h.w.Write(h.lenBuf[:]); err != nil {
+	if _, err := h.w.Write(lenBuf[:]); err != nil {
 		return err
 	}
 	if _, err := h.w.Write(msgb); err != nil {
@@ -822,7 +842,14 @@ func (h *host) emitStatus(force bool) {
 	} else if !st.Running {
 		st.Error = "State: " + h.lastState.String()
 	}
-	if h.watchDead {
+	// Only where there is nothing else to say. The state string stopped being
+	// display text when the extension started reading it to decide where the
+	// user's traffic goes: overwriting "State: Stopped" with this told the
+	// extension a switched-off profile was something else, and it routed the
+	// browser into a backend that was not running. It also used to eat
+	// "State: Starting" and NeedsLogin, which the popup renders as progress
+	// and as a login link rather than as an error.
+	if h.watchDead && st.Error == "" && !st.NeedsLogin {
 		st.Error = "WatchIPNBus stopped"
 	}
 	hasServer := h.ts.Sys() != nil
@@ -1024,6 +1051,18 @@ func firstIP(ips []netip.Addr) string {
 }
 
 func (h *host) serveInternalData(w http.ResponseWriter, r *http.Request) {
+	// tsnet's LocalClient starts the server if it is not started, and Start is
+	// a sync.Once: a request that lands before init would start the node with
+	// no state directory and no hostname set, taking the default ones — a
+	// different, logged-out machine on the tailnet — and leave handleInit's
+	// assignments as no-ops.
+	h.mu.Lock()
+	started := h.ts.Sys() != nil
+	h.mu.Unlock()
+	if !started {
+		http.Error(w, "not init", http.StatusServiceUnavailable)
+		return
+	}
 	lc, err := h.ts.LocalClient()
 	if err != nil {
 		http.Error(w, err.Error(), 500)
@@ -1065,6 +1104,18 @@ func (h *host) serveInternalData(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *host) serveInternalSetExitNode(w http.ResponseWriter, r *http.Request) {
+	// tsnet's LocalClient starts the server if it is not started, and Start is
+	// a sync.Once: a request that lands before init would start the node with
+	// no state directory and no hostname set, taking the default ones — a
+	// different, logged-out machine on the tailnet — and leave handleInit's
+	// assignments as no-ops.
+	h.mu.Lock()
+	started := h.ts.Sys() != nil
+	h.mu.Unlock()
+	if !started {
+		http.Error(w, "not init", http.StatusServiceUnavailable)
+		return
+	}
 	var body struct {
 		ExitNode string `json:"exitNode"`
 	}
@@ -1086,6 +1137,18 @@ func (h *host) serveInternalSetExitNode(w http.ResponseWriter, r *http.Request) 
 }
 
 func (h *host) serveInternalLogout(w http.ResponseWriter, r *http.Request) {
+	// tsnet's LocalClient starts the server if it is not started, and Start is
+	// a sync.Once: a request that lands before init would start the node with
+	// no state directory and no hostname set, taking the default ones — a
+	// different, logged-out machine on the tailnet — and leave handleInit's
+	// assignments as no-ops.
+	h.mu.Lock()
+	started := h.ts.Sys() != nil
+	h.mu.Unlock()
+	if !started {
+		http.Error(w, "not init", http.StatusServiceUnavailable)
+		return
+	}
 	lc, err := h.ts.LocalClient()
 	if err != nil {
 		http.Error(w, err.Error(), 500)

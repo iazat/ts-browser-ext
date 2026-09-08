@@ -51,6 +51,11 @@ document.addEventListener("DOMContentLoaded", () => {
   let isConnected = false;
   let isLoading = true;
   let hasReceivedInitialState = false;
+  // Whether the background has said anything yet. The cached status below and
+  // the port race each other, and the cache must not paint over a live answer
+  // — least of all over an install command, which is the one message that says
+  // the cache describes a backend that is no longer there.
+  let painted = false;
 
   const port = chrome.runtime.connect({ name: "popup" });
 
@@ -65,7 +70,7 @@ document.addEventListener("DOMContentLoaded", () => {
     if (chrome.runtime.lastError || !cached || !cached.lastStatus) {
       return;
     }
-    if (hasReceivedInitialState) {
+    if (painted || hasReceivedInitialState) {
       return; // the live answer got here first
     }
     updateStatus(cached.lastStatus);
@@ -89,6 +94,11 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   function updateStatus(status) {
+    // The install-command and error branches below disable these, and nothing
+    // used to turn them back on: a popup told once to install a backend stayed
+    // inert for the rest of its life, even as that backend came up behind it.
+    toggleSlider.disabled = false;
+    settingsButton.hidden = false;
     isLoading = false;
     hasReceivedInitialState = true;
     if (status.error) {
@@ -107,12 +117,14 @@ document.addEventListener("DOMContentLoaded", () => {
         stateDisplay.textContent = "Connecting…";
         isLoading = true;
         updateSliderState();
+        renderExitNodes(status); // hides the picker while nothing is running
         return;
       }
       if (state === "NeedsMachineAuth") {
         stateDisplay.textContent = "Waiting for approval…";
         isLoading = true;
         updateSliderState();
+        renderExitNodes(status);
         return;
       }
       stateDisplay.textContent = `Error: ${status.error}`;
@@ -168,7 +180,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
   port.onMessage.addListener((msg) => {
     console.log("Received from background:", JSON.stringify(msg));
+    painted = true;
     if (msg.reconnecting) {
+      toggleSlider.disabled = false;
+      settingsButton.hidden = false;
       // The backend is installed and coming back — after a sleep, most likely.
       // Saying so beats printing an install command at someone who installed it
       // months ago.
@@ -199,12 +214,18 @@ document.addEventListener("DOMContentLoaded", () => {
 
   toggleSlider.addEventListener("change", () => {
     console.log("Toggle slider changed, current state:", isConnected);
-    chrome.runtime.sendMessage({ command: "toggleProxy" }, (response) => {
-      console.log("Received response from background:", response);
-      if (response && response.status) {
-        updateStatus(response.status);
+    // The state of the switch after the click, which is what the user asked
+    // for. The background used to invert its own idea of the state, and a
+    // worker that had just restarted had no idea at all.
+    chrome.runtime.sendMessage(
+      { command: "toggleProxy", enable: toggleSlider.checked },
+      (response) => {
+        console.log("Received response from background:", response);
+        if (response && response.status) {
+          updateStatus(response.status);
+        }
       }
-    });
+    );
     console.log("Sent toggleProxy command to background");
   });
 

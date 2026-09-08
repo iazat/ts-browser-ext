@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -212,5 +215,154 @@ func TestSendStatusSkipsRepeats(t *testing.T) {
 	h.answerStatus()
 	if got := frames(t, &buf); len(got) != 1 {
 		t.Errorf("a request went unanswered because the answer had not changed: %q", got)
+	}
+}
+
+// frame builds one length-prefixed message, the way the browser writes them.
+func frame(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out [4]byte
+	binary.LittleEndian.PutUint32(out[:], uint32(len(b)))
+	return append(out[:], b...)
+}
+
+// TestSendLeavesTheReadBufferAlone guards a shared four bytes.
+//
+// h.lenBuf belongs to readMessage, which spends nearly all its time parked in a
+// read into it. send used to write outgoing frame lengths there too, so an
+// incoming length could be overwritten by an outgoing one — or by another
+// sender, since the bus watcher and the message loop both reply — after which
+// the browser reads one message's length followed by another message's body and
+// the stream never recovers.
+func TestSendLeavesTheReadBufferAlone(t *testing.T) {
+	var buf bytes.Buffer
+	h := newHost(strings.NewReader(""), &buf)
+	h.logf = t.Logf
+	h.lenBuf = [4]byte{'k', 'e', 'e', 'p'}
+
+	if err := h.send(&reply{Status: &status{Running: true}}); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := string(h.lenBuf[:]); got != "keep" {
+		t.Errorf("send wrote %q into the buffer readMessage reads into", got)
+	}
+	if len(frames(t, &buf)) != 1 {
+		t.Error("the reply itself did not go out")
+	}
+}
+
+// TestOneBadCommandDoesNotEndTheProcess covers what a mistimed click costs.
+//
+// Every handler error used to end the message loop, and with it the process:
+// picking an exit node before the netmap arrived, or toggling before init
+// finished, took the whole tailnet down and cost a cold tsnet start. An init
+// that fails still ends it — that one leaves a process with no tailnet in it,
+// and dropping the port is how the extension knows to replace it.
+func TestOneBadCommandDoesNotEndTheProcess(t *testing.T) {
+	var in bytes.Buffer
+	in.Write(frame(t, request{Cmd: CmdSetExitNode, ExitNode: "nyc"})) // fails: not init
+	in.Write(frame(t, request{Cmd: CmdGetStatus}))                    // must still be read
+
+	var out bytes.Buffer
+	h := newHost(&in, &out)
+	h.logf = t.Logf
+
+	if err := h.readMessages(); err != io.EOF && err != io.ErrUnexpectedEOF {
+		t.Fatalf("the loop ended on %v, not on running out of input", err)
+	}
+	if got := len(frames(t, &out)); got < 2 {
+		t.Errorf("sent %d replies; the command after the failing one was never read", got)
+	}
+}
+
+func TestFailedInitStillEndsTheProcess(t *testing.T) {
+	var in bytes.Buffer
+	in.Write(frame(t, request{Cmd: CmdInit})) // no initID
+	in.Write(frame(t, request{Cmd: CmdGetStatus}))
+
+	h := newHost(&in, io.Discard)
+	h.logf = t.Logf
+
+	err := h.readMessages()
+	if err == nil || err == io.EOF {
+		t.Fatalf("kept a process with no tailnet in it alive: %v", err)
+	}
+}
+
+// TestDeadWatchDoesNotMaskTheState keeps one error field from eating another.
+//
+// The extension reads status.error to decide where the user's traffic goes:
+// "State: Stopped" means the profile is switched off and browsing goes direct.
+// Overwriting that with the dead-watch marker told it a switched-off profile
+// was something else, and it routed the browser into a backend that was not
+// running.
+func TestDeadWatchDoesNotMaskTheState(t *testing.T) {
+	var buf bytes.Buffer
+	h := newHost(strings.NewReader(""), &buf)
+	h.logf = t.Logf
+	h.lastState = ipn.Stopped
+	h.watchDead = true
+
+	h.answerStatus()
+
+	got := frames(t, &buf)
+	if len(got) != 1 {
+		t.Fatalf("expected one status, got %d", len(got))
+	}
+	if !strings.Contains(got[0], "State: Stopped") {
+		t.Errorf("the state the extension routes on was masked: %q", got[0])
+	}
+}
+
+func TestDeadWatchIsStillReportedWhenRunning(t *testing.T) {
+	var buf bytes.Buffer
+	h := newHost(strings.NewReader(""), &buf)
+	h.logf = t.Logf
+	h.lastState = ipn.Running
+	h.watchDead = true
+
+	h.answerStatus()
+
+	got := frames(t, &buf)
+	if len(got) != 1 || !strings.Contains(got[0], "WatchIPNBus stopped") {
+		t.Errorf("a backend that has gone deaf said nothing about it: %q", got)
+	}
+}
+
+// TestManagementPageDoesNotStartTsnet guards the state directory.
+//
+// tsnet's LocalClient starts the server if it is not started, and Start is a
+// sync.Once. A management page request that landed before init would start the
+// node with no state directory and no hostname — the tailnet's view of that is
+// a different machine, logged out — and leave handleInit unable to do anything
+// about it.
+func TestManagementPageDoesNotStartTsnet(t *testing.T) {
+	h := newHost(strings.NewReader(""), io.Discard)
+	h.logf = t.Logf
+
+	for _, tt := range []struct {
+		name    string
+		serve   func(http.ResponseWriter, *http.Request)
+		request *http.Request
+	}{
+		{"data", h.serveInternalData, httptest.NewRequest("GET", "/api/data", nil)},
+		{"logout", h.serveInternalLogout, httptest.NewRequest("POST", "/api/logout", nil)},
+		{"set-exit-node", h.serveInternalSetExitNode, httptest.NewRequest("POST", "/api/exit-node", strings.NewReader(`{"exitNode":""}`))},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			tt.serve(rec, tt.request)
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Errorf("answered %d before init; it must refuse rather than start a node of its own", rec.Code)
+			}
+			if h.ts.Sys() != nil {
+				t.Fatal("tsnet was started by a management page request, with no state directory set")
+			}
+		})
 	}
 }

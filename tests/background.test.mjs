@@ -49,6 +49,14 @@ function bringUp(calls, port = 41234) {
 // microtask after it starts.
 const flush = () => new Promise((r) => setTimeout(r, 0));
 
+// lastIconBase is the artwork the toolbar was last asked to show.
+function lastIconBase(calls) {
+  const path = calls.icons.at(-1);
+  if (!path) return null;
+  const one = typeof path === "string" ? path : path[16];
+  return one.replace(/^icons\//, "").replace(/-16\.png$/, "");
+}
+
 for (const target of TARGETS) {
   describe(`${target.name}: background.js`, () => {
     test("connects to its own native messaging host", () => {
@@ -183,6 +191,114 @@ for (const target of TARGETS) {
       );
     });
 
+
+    // What the review found, in the order it hurts. Each of these is a
+    // sequence a real machine produced and the mocks could not.
+    describe("what a click means", () => {
+      // A fresh worker starts with proxyEnabled false, so a toggle that
+      // inverted its own idea of the state turned a click meaning "off" into
+      // "on" — and recorded an intent the backend never received, which then
+      // outranked the profile's own on-disk preference for the life of the
+      // worker.
+      test("a switch flipped while there is no backend reaches the one that arrives", async () => {
+        const { calls } = loadBackground(
+          target.file,
+          target.flavor,
+          {},
+          { storage: { profileId: "test-profile-id", hostSeen: true } }
+        );
+        await flush(); // the popup would be showing "Reconnecting…" here
+
+        await sendCommand(calls, { command: "toggleProxy", enable: false });
+        assert.ok(
+          !calls.toNativeHost.some((m) => m.cmd === "down"),
+          "sanity: there is no backend to tell yet"
+        );
+
+        calls.onNativeMessage({ procRunning: { port: 41234 } }); // the replacement
+        await flush();
+
+        assert.ok(
+          calls.toNativeHost.some((m) => m.cmd === "down"),
+          "the switch the user flipped was dropped, and the backend never heard it"
+        );
+        assert.ok(
+          !target.isProxied(calls),
+          "routed the browser into a backend the user had just switched off"
+        );
+      });
+
+      test("a host that dies asks for nothing on the user's behalf", async () => {
+        const { calls } = loadBackground(target.file, target.flavor);
+        await flush();
+        bringUp(calls);
+        calls.onNativeDisconnect();
+        runTimers(calls);
+        calls.toNativeHost.length = 0;
+
+        calls.onNativeMessage({ procRunning: { port: 41235 } });
+        await flush();
+
+        assert.ok(
+          !calls.toNativeHost.some((m) => m.cmd === "down"),
+          "switched the profile off because its previous backend had died"
+        );
+      });
+
+      // In NeedsLogin the browser is routed — the backend dials out directly so
+      // the login page is reachable — while the panel draws the switch off. The
+      // toolbar said online over a panel asking for a login.
+      test("the toolbar does not claim connected while a login is wanted", () => {
+        const { calls } = loadBackground(target.file, target.flavor);
+        calls.onNativeMessage({ procRunning: { port: 41234 } });
+
+        calls.onNativeMessage({
+          status: { needsLogin: true, browseToURL: "https://login.tailscale.com/a/abc" },
+        });
+
+        assert.notEqual(
+          lastIconBase(calls),
+          "online",
+          "the toolbar said connected while the tailnet was asking for a login"
+        );
+      });
+    });
+
+    describe("one host at a time", () => {
+      // The stall guard expires, so a host that is slow to speak — a cold
+      // binary on a machine that has just woken — gets a second one started
+      // beside it. The first was left running, with listeners still writing
+      // into this script's state, and its late procRunning moved the browser
+      // onto the port of a backend that had never been told to start.
+      test("replacing a stalled host ends it and ignores what it says later", async () => {
+        const { sandbox, calls } = loadBackground(target.file, target.flavor);
+        await flush();
+        const stalled = calls.nativePorts[0];
+        assert.equal(calls.nativeConnects, 1);
+
+        const realNow = Date.now();
+        sandbox.Date = { now: () => realNow + 60000 }; // past the stall guard
+        goIdle(calls, "active");
+
+        assert.equal(calls.nativeConnects, 2, "never replaced a host that had said nothing");
+        assert.ok(stalled.disconnected, "left the stalled host running as a second process");
+
+        // The replacement is the one that gets initialised and routed.
+        calls.onNativeMessage({ procRunning: { port: 41235 }, status: { running: true } });
+        await flush();
+        assert.equal(sandbox.nativeProxyPort, 41235);
+
+        // And now the one we gave up on finally speaks.
+        stalled.deliver({ procRunning: { port: 9999 }, status: { running: true } });
+
+        assert.equal(
+          sandbox.nativeProxyPort,
+          41235,
+          "a host we had abandoned moved the browser onto its own port"
+        );
+      });
+    });
+
     // Opening the popup can mean waiting out a backend starting Tailscale from
     // cold, because the browser discarded this script's worker and took the
     // backend down with it. The popup cannot shorten that, but it can read the
@@ -299,10 +415,11 @@ for (const target of TARGETS) {
       }
     });
 
-    test("shows the install prompt with its own browser byte", () => {
+    test("shows the install prompt with its own browser byte", async () => {
       const { calls } = loadBackground(target.file, target.flavor);
       // No native host has answered yet, so the port is still considered dead.
       connectPopup(calls);
+      await flush(); // the prompt waits for storage to say it was never installed
 
       const prompt = calls.toPopup.find((m) => m.installCmd);
       assert.ok(prompt, "popup was never told how to install the native host");
@@ -319,7 +436,7 @@ for (const target of TARGETS) {
     // browser, an extension or the user says it is. Getting it wrong prints a
     // command that registers the native host under the other browser's name,
     // after which the popup still asks to install it.
-    test("names its own browser whatever the environment claims", () => {
+    test("names its own browser whatever the environment claims", async () => {
       const otherGlobal = target.name === "chrome" ? "browser" : "chrome";
       const otherAgent =
         target.name === "chrome"
@@ -332,6 +449,7 @@ for (const target of TARGETS) {
         navigator: { userAgent: otherAgent },
       });
       connectPopup(calls);
+      await flush();
 
       const { installCmd } = calls.toPopup.find((m) => m.installCmd);
       const expected = target.name === "chrome" ? "--install=C" : "--install=F";
@@ -569,14 +687,36 @@ for (const target of TARGETS) {
       test("stops holding the worker open once the backend is gone", () => {
         const { calls } = loadBackground(target.file, target.flavor);
         bringUp(calls);
+        assert.equal(calls.timers.filter(Boolean).length, 1, "sanity: the keepalive is armed");
+
         calls.onNativeDisconnect();
+
+        // The timer itself has to be cancelled, not merely made harmless by a
+        // check inside its callback: what is left armed is what holds a worker
+        // open for a backend that is not there. Only the reconnect retry the
+        // disconnect just scheduled should remain.
+        const armed = calls.timers.filter(Boolean);
+        assert.equal(armed.length, 1, `expected only the reconnect retry, got ${armed.length}`);
+        assert.equal(armed[0].ms, 1000, "the one left armed is not the reconnect retry");
+
         calls.toNativeHost.length = 0;
-
         runTimers(calls);
-
         assert.ok(
           !calls.toNativeHost.some((m) => m.cmd === "get-status"),
           "kept talking to a port that is not there"
+        );
+      });
+
+      // alarms.create answers with a promise on Chrome, and an unheld rejection
+      // lands in the extension's error list as an uncaught error whose stack
+      // says background.js:0 and nothing else.
+      test("an alarm registration that is refused is reported, not thrown", async () => {
+        const { calls } = loadBackground(target.file, target.flavor, {}, { alarmsFail: true });
+        await flush();
+
+        assert.ok(
+          calls.errors.some((e) => e.includes("reconnect alarm")),
+          `the refusal went unhandled; errors were ${JSON.stringify(calls.errors)}`
         );
       });
 
@@ -694,10 +834,19 @@ for (const target of TARGETS) {
         calls.onNativeDisconnect();
         runTimers(calls);
 
-        // The replacement listens somewhere else: the kernel picks the port.
-        calls.onNativeMessage({ procRunning: { port: 41235 }, status: { running: true } });
+        // The live case, and the one that hurts: between a wake and the new
+        // backend reaching Running the browser is on a direct connection —
+        // which, with an exit node configured, is traffic leaving from this
+        // machine's own address. It must be taken back before then, not after.
+        calls.onNativeMessage({ procRunning: { port: 41235 } });
+        assert.ok(
+          target.isProxied(calls),
+          "left the browser direct while the replacement was still starting"
+        );
+        assert.equal(sandbox.lastProxyPort, 41235);
 
-        assert.ok(target.isProxied(calls), "the browser is not going through the new backend");
+        calls.onNativeMessage({ status: { running: true } });
+        assert.ok(target.isProxied(calls));
         assert.equal(
           sandbox.lastProxyPort,
           41235,
@@ -785,9 +934,10 @@ for (const target of TARGETS) {
     // This fork's native host understands set-exit-node and reports exitNodes;
     // upstream's does not. Pointing people at the wrong module hands them a
     // host that half-works, with no hint as to why, so pin it to this repo.
-    test("the install prompt installs this fork, not upstream", () => {
+    test("the install prompt installs this fork, not upstream", async () => {
       const { calls } = loadBackground(target.file, target.flavor);
       connectPopup(calls);
+      await flush();
 
       const { installCmd } = calls.toPopup.find((m) => m.installCmd);
       assert.ok(

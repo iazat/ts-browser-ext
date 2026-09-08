@@ -7,9 +7,14 @@
 import fs from "node:fs";
 import vm from "node:vm";
 
+// Answers the way the browser does: never in the same turn. A mock that called
+// its callback synchronously made storage look like a local variable, and the
+// extension read the answer before it could possibly have arrived — which is
+// exactly the bug that shipped, where a popup was told to install a backend
+// that had been installed for months because the read had not landed yet.
 function respond(cb, value) {
   if (typeof cb === "function") {
-    cb(value);
+    queueMicrotask(() => cb(value));
     return undefined;
   }
   return Promise.resolve(value);
@@ -21,12 +26,14 @@ function respond(cb, value) {
 // in the wild against storage, and reading a field off that nothing threw.
 function refuse(cb, api, message) {
   if (typeof cb === "function") {
-    api.runtime.lastError = { message };
-    try {
-      cb(undefined);
-    } finally {
-      api.runtime.lastError = null;
-    }
+    queueMicrotask(() => {
+      api.runtime.lastError = { message };
+      try {
+        cb(undefined);
+      } finally {
+        api.runtime.lastError = null;
+      }
+    });
     return undefined;
   }
   return Promise.reject(new Error(message));
@@ -41,7 +48,9 @@ function refuse(cb, api, message) {
 // `opts.storage` seeds storage.local, so a test can start a script the way a
 // second service worker starts: with whatever the first one wrote still there.
 // `opts.storageFailures` and `opts.storageWriteFailures` make that many reads,
-// or writes, refuse before any of them work.
+// or writes, refuse before any of them work. `opts.alarmsFail` makes alarm
+// registration reject, the way it does when the browser is discarding the
+// worker around the call.
 export function loadBackground(file, flavor, extraGlobals = {}, opts = {}) {
   const calls = {
     proxyListeners: [], // handlers currently registered on proxy.onRequest
@@ -51,6 +60,8 @@ export function loadBackground(file, flavor, extraGlobals = {}, opts = {}) {
     toPopup: [], //        messages posted down the popup port
     icons: [], //          icon base names the script asked for
     nativeConnects: 0, //  calls to connectNative, i.e. hosts started
+    nativePorts: [], //    one per connectNative, oldest first
+    errors: [], //         everything the script reported through console.error
     alarmsCreated: [], //  alarms the script asked the browser to keep
     timers: [], //         pending setTimeout callbacks, fired by runTimers
     // `opts.storage` replaces the seed rather than adding to it, so a test can
@@ -61,11 +72,31 @@ export function loadBackground(file, flavor, extraGlobals = {}, opts = {}) {
     uuidsMade: 0, //       ids handed to the script, to keep them distinct
   };
 
-  const nativePort = {
-    postMessage: (m) => calls.toNativeHost.push(m),
-    onDisconnect: { addListener: (f) => (calls.onNativeDisconnect = f) },
-    onMessage: { addListener: (f) => (calls.onNativeMessage = f) },
-  };
+  // Each connectNative answers with its own port, as the browser does. Handing
+  // out one shared object hid a superseded port whose listeners went on
+  // writing into the extension's state after it had moved to another host.
+  function makeNativePort() {
+    const port = {
+      disconnected: false,
+      sent: [],
+      postMessage: (m) => (port.sent.push(m), calls.toNativeHost.push(m)),
+      disconnect: () => (port.disconnected = true),
+      onDisconnect: {
+        addListener: (f) => {
+          port.fireDisconnect = f;
+          calls.onNativeDisconnect = f; // the latest port is the live one
+        },
+      },
+      onMessage: {
+        addListener: (f) => {
+          port.deliver = f;
+          calls.onNativeMessage = f;
+        },
+      },
+    };
+    calls.nativePorts.push(port);
+    return port;
+  }
 
   const api = {
     action: {
@@ -94,7 +125,7 @@ export function loadBackground(file, flavor, extraGlobals = {}, opts = {}) {
       id: "test-extension-id",
       lastError: null,
       connectNative: (name) => (
-        (calls.nativeHostName = name), calls.nativeConnects++, nativePort
+        (calls.nativeHostName = name), calls.nativeConnects++, makeNativePort()
       ),
       onConnect: { addListener: (f) => (calls.onConnect = f) },
       onMessage: { addListener: (f) => (calls.onMessage = f) },
@@ -115,7 +146,12 @@ export function loadBackground(file, flavor, extraGlobals = {}, opts = {}) {
     // The two ways the browser can start the script back up after the machine
     // has been away: a due alarm, and the machine going active again.
     alarms: {
-      create: (name, info) => calls.alarmsCreated.push({ name, ...info }),
+      create: (name, info) => {
+        calls.alarmsCreated.push({ name, ...info });
+        return opts.alarmsFail
+          ? Promise.reject(new Error("No SW"))
+          : Promise.resolve();
+      },
       onAlarm: { addListener: (f) => (calls.onAlarm = f) },
     },
     idle: {
@@ -127,7 +163,11 @@ export function loadBackground(file, flavor, extraGlobals = {}, opts = {}) {
 
   const sandbox = {
     [flavor]: api,
-    console: { log() {}, error() {}, warn() {} },
+    console: {
+      log() {},
+      warn() {},
+      error: (...args) => calls.errors.push(args.map(String).join(" ")),
+    },
     // Timers are collected rather than run, so a test decides when the retry
     // it scheduled happens. Ids start at 1: 0 is falsy, and the script tells
     // "no timer pending" from "timer pending" by the value it holds.
@@ -145,7 +185,7 @@ export function loadBackground(file, flavor, extraGlobals = {}, opts = {}) {
   vm.createContext(sandbox);
   vm.runInContext(fs.readFileSync(file, "utf8"), sandbox, { filename: file });
 
-  return { sandbox, calls, nativePort };
+  return { sandbox, calls };
 }
 
 // runTimers fires every setTimeout the script has pending, oldest first, the

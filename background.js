@@ -33,11 +33,23 @@ function setPopupIcon(base) {
   });
 }
 
+// pendingWant is a request the user made while there was no backend to hear
+// it: true for on, false for off, null when nothing is owed.
+//
+// Recording the intent without delivering it is what let a click during
+// "Reconnecting…" outlive the host it was meant for. The wish then outranked
+// the profile's own on-disk preference for the life of the worker — routing the
+// browser into a backend that had never been told to come up, or refusing to
+// route one that was already running — and nothing ever reconciled the two.
+let pendingWant = null;
+
 function enableProxy() {
   if (deadPort) {
-    console.error("Cannot enable proxy, disconnected from native host");
+    console.log("No backend to switch on yet; remembering the request");
+    pendingWant = true;
     return;
   }
+  pendingWant = null;
 
   nmPort.postMessage({ cmd: "up" });
 
@@ -80,6 +92,11 @@ function stopBrowserProxy() {
   clearBrowserProxy();
 }
 
+// wasProxied is set when a host dies while the browser was going through it,
+// and cleared once the browser is routed again or the backend says it is
+// stopped. It is what shortens the direct window across a restart.
+let wasProxied = false;
+
 // proxyWanted is what the user last asked of the toggle: true, false, or null
 // when they have not touched it since this script started. Null is the normal
 // state after a wake from sleep, and it is why the backend gets the last word
@@ -114,6 +131,7 @@ function isStopped(status) {
 // safeToDial in the Go host).
 function syncProxyToBackend(status) {
   if (isStopped(status)) {
+    wasProxied = false;
     if (proxyEnabled && proxyWanted !== true) {
       console.log("Backend is stopped; handing browsing back to direct");
       stopBrowserProxy();
@@ -130,6 +148,7 @@ function syncProxyToBackend(status) {
         : "Backend is coming up; routing the browser through it rather than " +
             "leaving it on a port nothing is listening on"
     );
+    wasProxied = false;
     setProxy(nativeProxyPort);
   }
 }
@@ -139,13 +158,10 @@ function disableProxy() {
   if (nmPort && !deadPort) {
     console.log("Sending down command to native host");
     nmPort.postMessage({ cmd: "down" });
+    pendingWant = null;
   } else {
-    console.log(
-      "Cannot send down command - nmPort:",
-      !!nmPort,
-      "deadPort:",
-      deadPort
-    );
+    console.log("No backend to switch off yet; remembering the request");
+    pendingWant = false;
   }
   stopBrowserProxy();
   console.log(
@@ -212,7 +228,13 @@ function sendPopupStatus() {
     // means it is being restarted, not missing. Give up on that story once the
     // reconnects keep failing, because by then it may really be gone — someone
     // ran --uninstall, or the browser cannot launch it any more.
-    if (hostSeen && failedConnects <= 3) {
+    // "Storage has not answered yet" is not "never installed". That read is
+    // asynchronous and the popup opening is often what started this worker, so
+    // the answer routinely lands after the popup has already been told
+    // something -- and what it used to be told was an install command for a
+    // backend installed months ago, over a toggle the popup then disabled and
+    // never turned back on.
+    if ((hostSeen || !profileID || profileReadPending) && failedConnects <= 3) {
       console.log("sendPopupStatus... reconnecting to the native host");
       sendToPopup({ reconnecting: true });
       return;
@@ -226,7 +248,7 @@ function sendPopupStatus() {
     });
     return;
   }
-  setPopupIcon(proxyEnabled ? "online" : "offline");
+  setPopupIcon(!!(lastStatus && lastStatus.running));
 
   sendToPopup({ status: lastStatus });
 }
@@ -399,9 +421,27 @@ function connectToNativeHost() {
   }
   connectingSince = Date.now();
   console.log("Connecting to native messaging host...");
-  nmPort = chrome.runtime.connectNative("io.github.iazat.tailext.chrome");
+  const port = chrome.runtime.connectNative("io.github.iazat.tailext.chrome");
+  const previous = nmPort;
+  nmPort = port;
+  if (previous) {
+    // The host on that port may still be starting — the stall guard above
+    // expires, and a cold binary on a machine that has just woken can take
+    // longer than it. Nobody will read from it again, so end it: left alone it
+    // is a second process holding this profile's state directory, with a
+    // listener still writing into these globals. Assigning nmPort first means
+    // its handlers see themselves superseded and stand down.
+    try {
+      previous.disconnect();
+    } catch (error) {
+      console.error("ending the port being replaced:", error && error.message);
+    }
+  }
 
-  nmPort.onDisconnect.addListener(() => {
+  port.onDisconnect.addListener(() => {
+    if (port !== nmPort) {
+      return; // a port already replaced; its host is not ours to mourn
+    }
     deadPort = true;
     connectingSince = 0;
     stopKeepalive();
@@ -414,7 +454,16 @@ function connectToNativeHost() {
     didInit = false;
     failedConnects++;
     setPopupIcon("need-install");
-    disableProxy();
+    // Whether the browser was going through the host that just died. Its
+    // replacement is a second away and will listen on a different port, and
+    // until then the browser is on a direct connection — which, with an exit
+    // node configured, is traffic leaving from this machine's own address.
+    // So the replacement takes the browser back as soon as it has a port,
+    // rather than waiting for it to finish starting Tailscale.
+    wasProxied = proxyEnabled;
+    // Not disableProxy(): that is the user's "off", and it now remembers a
+    // request it could not deliver. A host that died asked for nothing.
+    stopBrowserProxy();
     const error = chrome.runtime.lastError;
     if (error) {
       console.error("Connection failed:", error.message);
@@ -429,7 +478,13 @@ function connectToNativeHost() {
     scheduleReconnect();
     sendPopupStatus();
   });
-  nmPort.onMessage.addListener((message) => {
+  port.onMessage.addListener((message) => {
+    if (port !== nmPort) {
+      // A host we gave up on, finally speaking. Acting on it would point the
+      // browser at a backend that was never told to start.
+      console.log("ignoring a message from a port we replaced");
+      return;
+    }
     console.log("got message: " + JSON.stringify(message));
     if (deadPort) {
       console.log("connected to native backend");
@@ -443,13 +498,19 @@ function connectToNativeHost() {
     if (message.procRunning) {
       if (message.procRunning.port) {
         nativeProxyPort = message.procRunning.port;
-        // Whether to route the browser through it is the next status message's
-        // call, not this one's: the backend's preferences are on disk and
-        // remember whether this profile was left connected, while a worker that
-        // has just started remembers nothing. Routing on sight is what switched
-        // the tailnet back on for people who had switched it off, and pointed
-        // the browser into a backend that was still stopped.
-        if (proxyWanted === true) {
+        // Whether to route the browser through it is normally the next status
+        // message's call, not this one's: the backend's preferences are on
+        // disk and remember whether this profile was left connected, while a
+        // worker that has just started remembers nothing. Routing on sight is
+        // what switched the tailnet back on for people who had switched it
+        // off, and pointed the browser into a backend that was still stopped.
+        //
+        // The exception is a browser that was going through the host that just
+        // died. It is on a direct connection until something re-points it, and
+        // this port belongs to a live host that refuses to dial until dialling
+        // is safe — so taking it back now costs a moment of failed loads at
+        // worst, and saves a window of traffic leaving from the wrong address.
+        if (proxyWanted === true || wasProxied) {
           setProxy(message.procRunning.port);
         }
       } else if (message.procRunning.error) {
@@ -469,6 +530,7 @@ function connectToNativeHost() {
       syncProxyToBackend(message.status);
     }
     maybeSendInit();
+    deliverPendingWant();
     sendPopupStatus();
   });
 }
@@ -529,6 +591,22 @@ var didInit = false;
 let profileReadPending = false;
 const profileRetryMs = 1000;
 
+// deliverPendingWant hands the backend the switch the user flipped while there
+// was nothing to hand it to. It goes after the init, which the same handler
+// sends first, so the host has a tailnet to apply it to.
+function deliverPendingWant() {
+  if (pendingWant === null || deadPort || !didInit) {
+    return;
+  }
+  const want = pendingWant;
+  pendingWant = null;
+  console.log("Delivering the switch the user flipped while we were down: " + want);
+  nmPort.postMessage({ cmd: want ? "up" : "down" });
+  if (want && nativeProxyPort) {
+    setProxy(nativeProxyPort);
+  }
+}
+
 function maybeSendInit() {
   if (!profileID) {
     // Nothing to init with yet. Every message from a backend is another chance
@@ -573,6 +651,7 @@ function loadProfile() {
       console.log("Profile ID already exists:", result.profileId);
       profileID = result.profileId;
       maybeSendInit();
+      sendPopupStatus(); // correct whatever the popup was told before this
       return;
     }
     const profileId = crypto.randomUUID();
@@ -588,6 +667,7 @@ function loadProfile() {
       console.log("Generated profile ID:", profileId);
       profileID = profileId;
       maybeSendInit();
+      sendPopupStatus(); // a profile with no backend gets the command now
     });
   });
 }
@@ -604,23 +684,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return;
   }
   if (message.command === "toggleProxy") {
-    console.log("bg: toggleProxy received, current proxy=" + proxyEnabled);
-    proxyEnabled = !proxyEnabled;
-    proxyWanted = proxyEnabled; // an explicit request outranks the backend
-    if (proxyEnabled) {
+    // What the popup asked for, rather than the inverse of a variable this
+    // worker may have just lost. A fresh worker starts with proxyEnabled
+    // false, so a blind flip turned a click meaning "off" into "on" — and in
+    // NeedsLogin, where the browser is routed while the panel draws the switch
+    // off, it turned "connect" into a "down" that switched the profile off on
+    // disk. The popup sends the state of the switch the user just operated.
+    const want =
+      typeof message.enable === "boolean" ? message.enable : !proxyEnabled;
+    console.log("bg: toggleProxy received, asked for " + want);
+    proxyWanted = want;
+    if (want) {
       console.log("bg: Enabling proxy");
       enableProxy();
-      console.log("bg: toggleProxy on, now proxy=" + proxyEnabled);
       sendResponse({ status: lastStatus });
-      console.log("bg: toggleProxy on, sent status response");
     } else {
       console.log("bg: Disabling proxy");
       disableProxy();
-      console.log("bg: toggleProxy off, now proxy=" + proxyEnabled);
       sendResponse({ status: "Disconnected" });
-      console.log("bg: toggleProxy off, sent disconnected response");
+      // Switching off is immediate and needs no confirmation from anyone.
+      // Switching on is not: the icon waits for the backend to say it is up.
+      setPopupIcon(false);
     }
-    setPopupIcon(proxyEnabled);
     return true; // Keep the message channel open for the async response
   }
 });
