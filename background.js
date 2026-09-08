@@ -601,7 +601,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // started fresh, idle flips back to active, and any alarm that came due while
 // the machine was off is delivered late. Each one does nothing unless the port
 // is actually dead, so they cost nothing while the backend is healthy.
-chrome.alarms.create(reconnectAlarmName, { periodInMinutes: 1 });
+// The answer is a promise on Chrome and nothing at all on Firefox, and a
+// promise nobody holds rejects loudly — "No SW", when the browser is
+// discarding this worker around the call — into the extension's error list,
+// with a stack pointing at the top of this file and no hint of which line.
+// Resolve first, so either shape ends in the same handler.
+Promise.resolve(chrome.alarms.create(reconnectAlarmName, { periodInMinutes: 1 })).catch(
+  (error) => {
+    console.error("registering the reconnect alarm:", error && error.message);
+  }
+);
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === reconnectAlarmName) {
