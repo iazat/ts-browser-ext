@@ -135,7 +135,15 @@ document.addEventListener("DOMContentLoaded", () => {
       isConnected = status.running;
       updateSliderState();
       renderExitNodes(status);
+      return;
     }
+    // A status with nothing in it: the backend is there but has not said a
+    // word about itself yet. Rendering none of the above left the panel blank
+    // under a toggle that still looked switched on — which is how a backend
+    // that had never been told to start read as a working one.
+    stateDisplay.textContent = "Connecting…";
+    isLoading = true;
+    updateSliderState();
   }
 
   port.onMessage.addListener((msg) => {

@@ -15,6 +15,23 @@ function respond(cb, value) {
   return Promise.resolve(value);
 }
 
+// refuse answers the way the browser does when an extension API call cannot be
+// served — "No SW", when the worker is being torn down around it. Chrome hands
+// the callback nothing and sets lastError; Firefox rejects. Both have been seen
+// in the wild against storage, and reading a field off that nothing threw.
+function refuse(cb, api, message) {
+  if (typeof cb === "function") {
+    api.runtime.lastError = { message };
+    try {
+      cb(undefined);
+    } finally {
+      api.runtime.lastError = null;
+    }
+    return undefined;
+  }
+  return Promise.reject(new Error(message));
+}
+
 // loadBackground evaluates a background.js in a fresh sandbox and returns the
 // sandbox plus a record of everything the script did to the browser.
 //
@@ -23,6 +40,8 @@ function respond(cb, value) {
 // environment that lies about which browser it is running in.
 // `opts.storage` seeds storage.local, so a test can start a script the way a
 // second service worker starts: with whatever the first one wrote still there.
+// `opts.storageFailures` and `opts.storageWriteFailures` make that many reads,
+// or writes, refuse before any of them work.
 export function loadBackground(file, flavor, extraGlobals = {}, opts = {}) {
   const calls = {
     proxyListeners: [], // handlers currently registered on proxy.onRequest
@@ -34,7 +53,12 @@ export function loadBackground(file, flavor, extraGlobals = {}, opts = {}) {
     nativeConnects: 0, //  calls to connectNative, i.e. hosts started
     alarmsCreated: [], //  alarms the script asked the browser to keep
     timers: [], //         pending setTimeout callbacks, fired by runTimers
-    storage: { profileId: "test-profile-id", ...(opts.storage || {}) },
+    // `opts.storage` replaces the seed rather than adding to it, so a test can
+    // start from a profile that has never stored anything.
+    storage: opts.storage ? { ...opts.storage } : { profileId: "test-profile-id" },
+    storageFailures: opts.storageFailures || 0, //           reads still to refuse
+    storageWriteFailures: opts.storageWriteFailures || 0, //  writes still to refuse
+    uuidsMade: 0, //       ids handed to the script, to keep them distinct
   };
 
   const nativePort = {
@@ -78,8 +102,14 @@ export function loadBackground(file, flavor, extraGlobals = {}, opts = {}) {
     },
     storage: {
       local: {
-        get: (key, cb) => respond(cb, { ...calls.storage }),
-        set: (items, cb) => (Object.assign(calls.storage, items), respond(cb, undefined)),
+        get: (key, cb) =>
+          calls.storageFailures-- > 0
+            ? refuse(cb, api, "No SW")
+            : respond(cb, { ...calls.storage }),
+        set: (items, cb) =>
+          calls.storageWriteFailures-- > 0
+            ? refuse(cb, api, "No SW")
+            : (Object.assign(calls.storage, items), respond(cb, undefined)),
       },
     },
     // The two ways the browser can start the script back up after the machine
@@ -105,7 +135,9 @@ export function loadBackground(file, flavor, extraGlobals = {}, opts = {}) {
     clearTimeout: (id) => {
       if (id) calls.timers[id - 1] = null;
     },
-    crypto: { randomUUID: () => "test-uuid" },
+    // Distinct each time, as a real one is: a test can then tell the id that
+    // was kept from one that was generated and thrown away.
+    crypto: { randomUUID: () => `test-uuid-${++calls.uuidsMade}` },
     URL,
     Promise,
     ...extraGlobals,

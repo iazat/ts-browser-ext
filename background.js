@@ -274,7 +274,14 @@ function rememberHostSeen() {
     return;
   }
   hostSeen = true;
-  chrome.storage.local.set({ hostSeen: true });
+  chrome.storage.local.set({ hostSeen: true }, () => {
+    const error = chrome.runtime.lastError;
+    if (error) {
+      // Only costs the popup its "Reconnecting…" wording on a later start.
+      console.error("remembering that the backend is installed:", error.message);
+      hostSeen = false;
+    }
+  });
 }
 
 // connectingSince guards against starting a second backend on top of one that
@@ -489,30 +496,73 @@ function setProxy(proxyPort) {
 
 var profileID = "";
 var didInit = false;
+let profileReadPending = false;
+const profileRetryMs = 1000;
 
 function maybeSendInit() {
-  if (!profileID || didInit || deadPort) {
+  if (!profileID) {
+    // Nothing to init with yet. Every message from a backend is another chance
+    // at a read that storage refused earlier, and one arrives at least every
+    // keepalive — so a worker cannot get stuck here for the rest of its life.
+    loadProfile();
+    return;
+  }
+  if (didInit || deadPort) {
     return;
   }
   nmPort.postMessage({ cmd: "init", initID: profileID });
   didInit = true;
 }
 
-chrome.storage.local.get(["profileId", "hostSeen"], (result) => {
-  hostSeen = hostSeen || !!result.hostSeen;
-  if (!result.profileId) {
+// The profile id names the tsnet state directory, so it has to come back the
+// same on every start: a different one is a different machine on the tailnet,
+// logged out, with the old one's state stranded on disk. It lives in storage,
+// and storage does refuse to answer sometimes — "No SW", when the browser is
+// tearing this worker down around the call — handing back nothing at all.
+//
+// Reading a field off that nothing threw, and everything downstream went with
+// it: the init the backend needs before it starts Tailscale at all never
+// happened, so no status ever arrived, and the popup sat with its state line
+// blank over a backend that had been told to do nothing. So a refusal is now
+// something to ask again about, never something to invent an id over.
+function loadProfile() {
+  if (profileID || profileReadPending) {
+    return;
+  }
+  profileReadPending = true;
+  chrome.storage.local.get(["profileId", "hostSeen"], (result) => {
+    profileReadPending = false;
+    const error = chrome.runtime.lastError;
+    if (error || !result) {
+      console.error("reading the profile from storage:", error && error.message);
+      setTimeout(loadProfile, profileRetryMs);
+      return;
+    }
+    hostSeen = hostSeen || !!result.hostSeen;
+    if (result.profileId) {
+      console.log("Profile ID already exists:", result.profileId);
+      profileID = result.profileId;
+      maybeSendInit();
+      return;
+    }
     const profileId = crypto.randomUUID();
     chrome.storage.local.set({ profileId }, () => {
+      const saveError = chrome.runtime.lastError;
+      if (saveError) {
+        // An id that did not stick is worse than none: the next start would
+        // make another one, and the tailnet would see a new machine each time.
+        console.error("saving the profile id:", saveError.message);
+        setTimeout(loadProfile, profileRetryMs);
+        return;
+      }
       console.log("Generated profile ID:", profileId);
       profileID = profileId;
       maybeSendInit();
     });
-  } else {
-    console.log("Profile ID already exists:", result.profileId);
-    profileID = result.profileId;
-    maybeSendInit();
-  }
-});
+  });
+}
+
+loadProfile();
 
 // Listener for messages from the popup
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {

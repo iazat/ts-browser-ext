@@ -235,6 +235,19 @@ for (const target of TARGETS) {
       await page.close();
     });
 
+    // The background hands over whatever the backend last said, and until it
+    // has said anything that is an empty object. None of the branches above
+    // match it, so the panel used to render blank under a toggle that looked
+    // switched on — a backend that never started, wearing the face of one that
+    // works.
+    test("says something for a status that carries nothing", async () => {
+      const { page } = await open(target, { status: {} });
+      assert.equal((await page.textContent("#state")).trim(), "Connecting…");
+      const cls = await page.getAttribute(".slider", "class");
+      assert.ok(cls.includes("loading"), `expected the spinner, got ${cls}`);
+      await page.close();
+    });
+
     test("a genuine error is still surfaced", async () => {
       const { page } = await open(target, { status: { error: "something broke" } });
       const text = await page.textContent("#state");

@@ -532,6 +532,65 @@ for (const target of TARGETS) {
         );
       });
 
+      // Storage does refuse, with nothing where the answer should be. Reading
+      // a field off that threw, and the throw took out everything the callback
+      // had left to do — including the init without which the backend never
+      // starts Tailscale. The popup then sat with a blank state line, waiting
+      // on a backend that had been told to do nothing at all.
+      test("survives storage refusing to answer", async () => {
+        // Reading a field off the nothing storage hands back used to throw
+        // right here, during the load, and the throw took the init with it.
+        const { calls } = loadBackground(target.file, target.flavor, {}, { storageFailures: 1 });
+        await flush();
+
+        bringUp(calls); // a message is itself another chance at the read
+        await flush();
+
+        assert.ok(
+          calls.toNativeHost.some((m) => m.cmd === "init"),
+          "the backend was never told to start Tailscale, so it never would have"
+        );
+      });
+
+      test("keeps asking while storage keeps refusing", async () => {
+        const { calls } = loadBackground(target.file, target.flavor, {}, { storageFailures: 2 });
+        await flush();
+        bringUp(calls); // the second refusal is spent here
+        await flush();
+        assert.ok(!calls.toNativeHost.some((m) => m.cmd === "init"), "sanity: nothing to init with yet");
+
+        runTimers(calls); // the retry it scheduled
+        await flush();
+
+        assert.ok(
+          calls.toNativeHost.some((m) => m.cmd === "init"),
+          "gave up on storage, leaving the backend idle for the life of the worker"
+        );
+      });
+
+      test("never uses a profile id that storage would not keep", async () => {
+        // The id names the tsnet state directory. One that did not stick is a
+        // different machine on the tailnet, logged out, at the next start.
+        const { calls } = loadBackground(
+          target.file,
+          target.flavor,
+          {},
+          { storage: {}, storageWriteFailures: 1 } // nothing saved yet, and the write refuses
+        );
+        await flush(); // the first id is made, and the write refuses it
+        bringUp(calls); // another go: a second id, and this write lands
+        await flush();
+
+        const init = calls.toNativeHost.find((m) => m.cmd === "init");
+        assert.ok(init, "never recovered once storage started accepting writes");
+        assert.equal(
+          init.initID,
+          calls.storage.profileId,
+          "inited with an id storage never kept — the next start would make another one, " +
+            "and the tailnet would see a new machine every time"
+        );
+      });
+
       test("its manifest asks for what the reconnect needs", async () => {
         const fs = await import("node:fs");
         const dir = path.dirname(target.file);
