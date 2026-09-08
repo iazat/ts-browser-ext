@@ -31,7 +31,21 @@ can keep work and personal tailnets fully separate.
 
 ## Fixed here
 
-Most of these predate the fork:
+- **A sleeping Mac left the extension dead until you poked it.** Waking up
+  takes the native backend down with the browser's worker, and nothing brought
+  either back: the reconnect covered only one of the two kinds of disconnect,
+  and a backend that did come back was never told to start Tailscale again, so
+  it proxied into nothing. The popup, meanwhile, asked you to install a backend
+  that had been installed for months. It now reconnects on its own — on a wake,
+  on a due alarm, on the popup opening — re-initialises the new backend, and
+  comes back in the state the backend says the profile was left in, rather than
+  switching the tailnet on for someone who had switched it off.
+- **A broken IPN watch was permanent.** The backend read its status over a
+  single watch on the Tailscale bus. Sleep breaks that watch, and the first
+  error ended it for good: the process stayed up knowing nothing, the popup
+  froze on whatever it last said, and only restarting the browser fixed it.
+
+Most of the rest predate the fork:
 
 - **The connect toggle only worked once.** Turning the extension off left the
   browser on a direct connection, and turning it back on never restored the

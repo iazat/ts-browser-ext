@@ -7,7 +7,15 @@ import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadBackground, connectPopup, sendCommand, plain } from "./webext-mock.mjs";
+import {
+  loadBackground,
+  connectPopup,
+  sendCommand,
+  plain,
+  runTimers,
+  fireAlarm,
+  goIdle,
+} from "./webext-mock.mjs";
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -34,6 +42,11 @@ const TARGETS = [
 function bringUp(calls, port = 41234) {
   calls.onNativeMessage({ procRunning: { port }, status: { running: true, tailnet: "test@example.com" } });
 }
+
+// flush lets the promise-flavoured mocks settle. Firefox's storage answers with
+// a promise, so what the script reads out of storage is only in place a
+// microtask after it starts.
+const flush = () => new Promise((r) => setTimeout(r, 0));
 
 for (const target of TARGETS) {
   describe(`${target.name}: background.js`, () => {
@@ -254,6 +267,287 @@ for (const target of TARGETS) {
         !installCmd.includes(wrong),
         `the ${target.name} copy read its browser off the environment: ${JSON.stringify(installCmd)}`
       );
+    });
+
+
+    // Everything below is about the machine going away and coming back, which
+    // on a Mac is an everyday event: the lid closes, the browser suspends, the
+    // worker running background.js is discarded, and the native host — a child
+    // process of the browser — dies with the port that carried it. What the
+    // user sees on waking is a reset extension, and how long it stays reset is
+    // entirely up to this file.
+    describe("waking up", () => {
+      test("reconnects after the native host goes away", () => {
+        const { calls } = loadBackground(target.file, target.flavor);
+        bringUp(calls);
+        const before = calls.nativeConnects;
+
+        calls.onNativeDisconnect();
+        runTimers(calls);
+
+        assert.ok(
+          calls.nativeConnects > before,
+          "nothing tried to start a new native host, so the extension stays dead until something else restarts this script"
+        );
+      });
+
+      // A host that exits by itself reports no lastError, and that is the
+      // disconnect a sleeping machine produces. The old code retried only the
+      // other kind, so waking up was the case it did not cover.
+      test("reconnects when the disconnect reports no error at all", () => {
+        const { calls, sandbox } = loadBackground(target.file, target.flavor);
+        bringUp(calls);
+        const before = calls.nativeConnects;
+        sandbox[target.flavor].runtime.lastError = null;
+
+        calls.onNativeDisconnect();
+        runTimers(calls);
+
+        assert.ok(calls.nativeConnects > before, "a clean disconnect was never retried");
+      });
+
+      test("backs off rather than restarting the host on a loop", () => {
+        const { calls } = loadBackground(target.file, target.flavor);
+        bringUp(calls);
+
+        const delays = [];
+        for (let i = 0; i < 4; i++) {
+          calls.onNativeDisconnect();
+          delays.push(calls.timers.filter(Boolean)[0].ms);
+          runTimers(calls);
+        }
+
+        assert.deepEqual(delays, [1000, 2000, 4000, 8000]);
+      });
+
+      // The host that answers a reconnect is a new process with no tsnet in
+      // it. Without another init it sits there with a proxy listener and no
+      // tailnet behind it, and the extension used to point the browser at it
+      // anyway: every page load then failed, and no status ever arrived, so
+      // the popup kept showing whatever it had said before the machine slept.
+      test("initialises the backend it reconnects to", async () => {
+        const { calls } = loadBackground(target.file, target.flavor);
+        await flush(); // the profile id it inits with comes out of storage
+        bringUp(calls);
+        calls.onNativeDisconnect();
+        runTimers(calls);
+        calls.toNativeHost.length = 0;
+
+        calls.onNativeMessage({ procRunning: { port: 41235 } }); // the new host says hello
+
+        assert.ok(
+          calls.toNativeHost.some((m) => m.cmd === "init"),
+          "the replacement host was never told to start tsnet, so it proxies nothing"
+        );
+      });
+
+      // Every connectNative starts a process, and several things can call for
+      // a reconnect at the same moment.
+      test("does not start a second backend on top of one that is starting", () => {
+        const { calls } = loadBackground(target.file, target.flavor);
+        const before = calls.nativeConnects; // the load has asked for one already
+
+        goIdle(calls, "active");
+        fireAlarm(calls, "reconnect-native-host");
+        connectPopup(calls);
+
+        assert.equal(calls.nativeConnects, before, "started more than one native host at once");
+      });
+
+      test("retries at once when the machine goes active again", () => {
+        const { calls } = loadBackground(target.file, target.flavor);
+        bringUp(calls);
+        calls.onNativeDisconnect();
+        const before = calls.nativeConnects;
+
+        goIdle(calls, "active");
+
+        assert.equal(calls.nativeConnects, before + 1, "a wake did not shorten the wait");
+      });
+
+      test("leaves the backend alone while it is healthy", () => {
+        const { calls } = loadBackground(target.file, target.flavor);
+        bringUp(calls);
+        const before = calls.nativeConnects;
+
+        goIdle(calls, "active");
+        fireAlarm(calls, "reconnect-native-host");
+
+        assert.equal(calls.nativeConnects, before, "started a second host on top of a working one");
+      });
+
+      // The worker is not alive to run a timer for long: the browser discards
+      // it when it goes idle and suspends everything when the lid closes. An
+      // alarm is held by the browser, which starts the worker again to deliver
+      // it, so it is what actually gets the extension back after a sleep.
+      test("keeps an alarm so the browser can restart it", () => {
+        const { calls } = loadBackground(target.file, target.flavor);
+
+        const alarm = calls.alarmsCreated.find((a) => a.name === "reconnect-native-host");
+        assert.ok(alarm, "no alarm was registered, so a discarded worker stays discarded");
+        assert.ok(alarm.periodInMinutes > 0, "the alarm fires once and never again");
+      });
+
+      test("the alarm reconnects a dead host", () => {
+        const { calls } = loadBackground(target.file, target.flavor);
+        bringUp(calls);
+        calls.onNativeDisconnect();
+        const before = calls.nativeConnects;
+
+        fireAlarm(calls, "reconnect-native-host");
+
+        assert.equal(calls.nativeConnects, before + 1);
+      });
+
+      test("opening the popup retries immediately", () => {
+        const { calls } = loadBackground(target.file, target.flavor);
+        bringUp(calls);
+        calls.onNativeDisconnect();
+        const before = calls.nativeConnects;
+
+        connectPopup(calls);
+
+        assert.equal(
+          calls.nativeConnects,
+          before + 1,
+          "someone is looking at the popup, which is the worst moment to be sitting out a backoff"
+        );
+      });
+
+      test("tells the popup it is reconnecting rather than to install it again", () => {
+        const { calls } = loadBackground(target.file, target.flavor);
+        bringUp(calls); // a backend has answered, so it is plainly installed
+        calls.onNativeDisconnect();
+        calls.toPopup.length = 0;
+
+        connectPopup(calls);
+
+        assert.ok(
+          calls.toPopup.some((m) => m.reconnecting),
+          "the popup was told nothing about the reconnect in progress"
+        );
+        assert.ok(
+          !calls.toPopup.some((m) => m.installCmd),
+          "printed an install command at someone whose backend is installed and merely restarting"
+        );
+      });
+
+      test("still offers the install command when the reconnects keep failing", () => {
+        const { calls } = loadBackground(target.file, target.flavor);
+        bringUp(calls);
+        for (let i = 0; i < 4; i++) {
+          calls.onNativeDisconnect();
+          runTimers(calls);
+        }
+        calls.toPopup.length = 0;
+
+        connectPopup(calls);
+
+        assert.ok(
+          calls.toPopup.some((m) => m.installCmd),
+          "a backend that never comes back may really be gone, and the popup has to say how to get it back"
+        );
+      });
+
+      test("remembers across restarts that a backend was ever installed", async () => {
+        const first = loadBackground(target.file, target.flavor);
+        bringUp(first.calls);
+        assert.equal(first.calls.storage.hostSeen, true, "nothing was written to survive the worker");
+
+        // A second worker, as the browser starts after a wake: same profile,
+        // same storage, no memory of anything else.
+        const { calls } = loadBackground(target.file, target.flavor, {}, { storage: first.calls.storage });
+        await flush();
+        calls.onNativeDisconnect();
+        calls.toPopup.length = 0;
+
+        connectPopup(calls);
+
+        assert.ok(
+          calls.toPopup.some((m) => m.reconnecting),
+          "a fresh worker forgot the backend was installed and asked for it to be installed again"
+        );
+      });
+
+      test("its manifest asks for what the reconnect needs", async () => {
+        const fs = await import("node:fs");
+        const dir = path.dirname(target.file);
+        const manifest = JSON.parse(fs.readFileSync(path.join(dir, "manifest.json"), "utf8"));
+
+        for (const perm of ["alarms", "idle", "storage", "nativeMessaging"]) {
+          assert.ok(
+            (manifest.permissions ?? []).includes(perm),
+            `the script uses ${perm}, which the manifest does not ask for — it throws on load without it`
+          );
+        }
+      });
+    });
+
+    // Which state the extension comes back in is the backend's to say. Its
+    // preferences are on disk, so it returns connected or switched off exactly
+    // as the user left it; this script's own state lives in a worker the
+    // browser throws away.
+    describe("state after a reconnect", () => {
+      test("does not route the browser into a backend that is not running", () => {
+        const { calls } = loadBackground(target.file, target.flavor);
+
+        calls.onNativeMessage({ procRunning: { port: 41234 } });
+
+        assert.ok(
+          !target.isProxied(calls),
+          "pointed the browser at a proxy before the backend said it was routing anything"
+        );
+      });
+
+      test("leaves a profile that was switched off switched off", () => {
+        const { calls } = loadBackground(target.file, target.flavor);
+
+        calls.onNativeMessage({ procRunning: { port: 41234 } });
+        calls.onNativeMessage({ status: { running: false, error: "State: Stopped" } });
+
+        assert.ok(
+          !target.isProxied(calls),
+          "switched the tailnet back on for a profile the user had switched off"
+        );
+      });
+
+      test("routes the browser again once the backend reports it is running", () => {
+        const { calls } = loadBackground(target.file, target.flavor);
+
+        calls.onNativeMessage({ procRunning: { port: 41234 } });
+        calls.onNativeMessage({ status: { running: true, tailnet: "test@example.com" } });
+
+        assert.ok(target.isProxied(calls), "the backend is up and the browser is not going through it");
+      });
+
+      test("hands browsing back when the backend stops routing", () => {
+        const { calls } = loadBackground(target.file, target.flavor);
+        bringUp(calls);
+        calls.toNativeHost.length = 0;
+
+        calls.onNativeMessage({ status: { running: false, error: "State: Stopped" } });
+
+        assert.ok(!target.isProxied(calls), "left the browser pointed at a backend that is not routing");
+        assert.ok(
+          !calls.toNativeHost.some((m) => m.cmd === "down"),
+          "answered the backend's own report by switching it off, which would still be off after the next restart"
+        );
+      });
+
+      // "Not running yet" is what the first seconds of a connection look like.
+      // Reading that as "the user wants this off" would drop the proxy under
+      // someone who has just switched it on.
+      test("keeps the proxy while the connection the user asked for comes up", async () => {
+        const { calls } = loadBackground(target.file, target.flavor);
+        bringUp(calls);
+        await sendCommand(calls, { command: "toggleProxy" }); // off
+        await sendCommand(calls, { command: "toggleProxy" }); // and on again
+        assert.ok(target.isProxied(calls), "expected to be proxied after switching back on");
+
+        calls.onNativeMessage({ status: { running: false, error: "State: Starting" } });
+
+        assert.ok(target.isProxied(calls), "dropped the proxy while the tailnet was still starting");
+      });
     });
 
     // This fork's native host understands set-exit-node and reports exitNodes;

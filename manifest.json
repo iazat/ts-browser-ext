@@ -12,6 +12,8 @@
   "permissions": [
     "proxy",
     "background",
+    "alarms",
+    "idle",
     "storage",
     "nativeMessaging"
   ],

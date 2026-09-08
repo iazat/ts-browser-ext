@@ -21,7 +21,9 @@ function respond(cb, value) {
 // `flavor` picks which global the script expects: "chrome" or "browser".
 // `extraGlobals` adds to the sandbox, so a test can hand the script an
 // environment that lies about which browser it is running in.
-export function loadBackground(file, flavor, extraGlobals = {}) {
+// `opts.storage` seeds storage.local, so a test can start a script the way a
+// second service worker starts: with whatever the first one wrote still there.
+export function loadBackground(file, flavor, extraGlobals = {}, opts = {}) {
   const calls = {
     proxyListeners: [], // handlers currently registered on proxy.onRequest
     removeMisses: 0, //    removeListener calls that matched no handler
@@ -29,6 +31,10 @@ export function loadBackground(file, flavor, extraGlobals = {}) {
     toNativeHost: [], //   messages posted to the native messaging port
     toPopup: [], //        messages posted down the popup port
     icons: [], //          icon base names the script asked for
+    nativeConnects: 0, //  calls to connectNative, i.e. hosts started
+    alarmsCreated: [], //  alarms the script asked the browser to keep
+    timers: [], //         pending setTimeout callbacks, fired by runTimers
+    storage: { profileId: "test-profile-id", ...(opts.storage || {}) },
   };
 
   const nativePort = {
@@ -63,15 +69,27 @@ export function loadBackground(file, flavor, extraGlobals = {}) {
     runtime: {
       id: "test-extension-id",
       lastError: null,
-      connectNative: (name) => ((calls.nativeHostName = name), nativePort),
+      connectNative: (name) => (
+        (calls.nativeHostName = name), calls.nativeConnects++, nativePort
+      ),
       onConnect: { addListener: (f) => (calls.onConnect = f) },
       onMessage: { addListener: (f) => (calls.onMessage = f) },
+      onStartup: { addListener: (f) => (calls.onStartup = f) },
     },
     storage: {
       local: {
-        get: (key, cb) => respond(cb, { profileId: "test-profile-id" }),
-        set: (items, cb) => respond(cb, undefined),
+        get: (key, cb) => respond(cb, { ...calls.storage }),
+        set: (items, cb) => (Object.assign(calls.storage, items), respond(cb, undefined)),
       },
+    },
+    // The two ways the browser can start the script back up after the machine
+    // has been away: a due alarm, and the machine going active again.
+    alarms: {
+      create: (name, info) => calls.alarmsCreated.push({ name, ...info }),
+      onAlarm: { addListener: (f) => (calls.onAlarm = f) },
+    },
+    idle: {
+      onStateChanged: { addListener: (f) => (calls.onIdleStateChanged = f) },
     },
     // Firefox-only: the popup warns when private browsing access is missing.
     extension: { isAllowedIncognitoAccess: () => Promise.resolve(true) },
@@ -80,7 +98,13 @@ export function loadBackground(file, flavor, extraGlobals = {}) {
   const sandbox = {
     [flavor]: api,
     console: { log() {}, error() {}, warn() {} },
-    setTimeout: () => 0,
+    // Timers are collected rather than run, so a test decides when the retry
+    // it scheduled happens. Ids start at 1: 0 is falsy, and the script tells
+    // "no timer pending" from "timer pending" by the value it holds.
+    setTimeout: (fn, ms) => calls.timers.push({ fn, ms }),
+    clearTimeout: (id) => {
+      if (id) calls.timers[id - 1] = null;
+    },
     crypto: { randomUUID: () => "test-uuid" },
     URL,
     Promise,
@@ -90,6 +114,28 @@ export function loadBackground(file, flavor, extraGlobals = {}) {
   vm.runInContext(fs.readFileSync(file, "utf8"), sandbox, { filename: file });
 
   return { sandbox, calls, nativePort };
+}
+
+// runTimers fires every setTimeout the script has pending, oldest first, the
+// way the browser would once the delay is up.
+export function runTimers(calls) {
+  const due = calls.timers;
+  calls.timers = [];
+  for (const t of due) {
+    if (t) t.fn();
+  }
+  return due.filter(Boolean).length;
+}
+
+// fireAlarm delivers an alarm, as the browser does — starting the script again
+// first, if it had been discarded.
+export function fireAlarm(calls, name) {
+  calls.onAlarm({ name });
+}
+
+// goIdle delivers an idle state change. "active" is the machine coming back.
+export function goIdle(calls, state) {
+  calls.onIdleStateChanged(state);
 }
 
 // plain copies a value out of the sandbox realm. Objects built inside the vm

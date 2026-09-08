@@ -25,7 +25,6 @@ import (
 	"time"
 
 	"tailscale.com/client/local"
-	"tailscale.com/client/tailscale"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
@@ -284,14 +283,21 @@ type host struct {
 	ln          net.Listener
 	wantUp      bool
 	// ...
+
+	// watchRetryMin and watchRetryMax bound the wait before a dropped IPN bus
+	// watch is re-established. They are fields rather than constants so the
+	// tests do not have to sit through a real backoff.
+	watchRetryMin, watchRetryMax time.Duration
 }
 
 func newHost(r io.Reader, w io.Writer) *host {
 	h := &host{
-		br:          bufio.NewReaderSize(r, 1<<20),
-		w:           w,
-		logf:        log.Printf,
-		exitNodeSet: true, // assume the strict case until Prefs says otherwise
+		br:            bufio.NewReaderSize(r, 1<<20),
+		w:             w,
+		logf:          log.Printf,
+		exitNodeSet:   true, // assume the strict case until Prefs says otherwise
+		watchRetryMin: 500 * time.Millisecond,
+		watchRetryMax: 30 * time.Second,
 	}
 	h.ts = &tsnet.Server{
 		RunWebClient: true,
@@ -569,20 +575,77 @@ func (h *host) handleInit(msg *request) (ret error) {
 		return fmt.Errorf("getting local client: %w", err)
 	}
 
-	// NotifyInitialNetMap matters: without it the first netmap only arrives
-	// when something about the tailnet happens to change, so a backend that
-	// comes up already logged in reports an empty tailnet name until then.
-	// It is not one of NotifyRateLimitIncompatibleBits, so it combines.
-	wc, err := lc.WatchIPNBus(h.ctx, ipn.NotifyInitialState|ipn.NotifyInitialNetMap|ipn.NotifyInitialPrefs|ipn.NotifyRateLimit)
+	wc, err := lc.WatchIPNBus(h.ctx, busWatchMask)
 	if err != nil {
 		return fmt.Errorf("watching IPN bus: %w", err)
 	}
-	go h.watchIPNBus(wc)
+	go h.watchBus(h.ctx, wc, func(ctx context.Context) (busWatcher, error) {
+		return lc.WatchIPNBus(ctx, busWatchMask)
+	})
 
 	return nil
 }
 
-func (h *host) watchIPNBus(wc *tailscale.IPNBusWatcher) {
+// busWatchMask is what this program asks the IPN bus for.
+//
+// NotifyInitialNetMap matters: without it the first netmap only arrives when
+// something about the tailnet happens to change, so a backend that comes up
+// already logged in reports an empty tailnet name until then. It is not one of
+// NotifyRateLimitIncompatibleBits, so it combines.
+const busWatchMask = ipn.NotifyInitialState | ipn.NotifyInitialNetMap | ipn.NotifyInitialPrefs | ipn.NotifyRateLimit
+
+// busWatcher is the part of tailscale.IPNBusWatcher used here. It is an
+// interface so the reconnect loop can be exercised without a backend running.
+type busWatcher interface {
+	Next() (ipn.Notify, error)
+	Close() error
+}
+
+// watchBus keeps a watch on the IPN bus for as long as ctx lives, beginning
+// with the one already open.
+//
+// One watch does not survive everything that happens under it. A Mac that
+// sleeps comes back with this one broken, and Next then fails once and for
+// good — which used to be the end of the only status the extension ever gets.
+// The backend kept running, deaf: the popup froze on whatever it had last
+// said, nothing noticed when the tailnet came back, and the way out was
+// restarting the browser. So the watch is rebuilt, backing off so a backend
+// that is genuinely gone is not hammered.
+func (h *host) watchBus(ctx context.Context, wc busWatcher, reconnect func(context.Context) (busWatcher, error)) {
+	for {
+		h.watchIPNBus(wc)
+		wc.Close()
+		delay := h.watchRetryMin // a watch that worked earns a fresh start
+		for {
+			if !sleepCtx(ctx, delay) {
+				return
+			}
+			next, err := reconnect(ctx)
+			if err == nil {
+				h.logf("IPN bus watch re-established")
+				wc = next
+				break
+			}
+			h.logf("re-establishing the IPN bus watch: %v; retrying in %v", err, delay)
+			delay = min(delay*2, h.watchRetryMax)
+		}
+	}
+}
+
+// sleepCtx waits for d, and reports whether it got there before ctx ended.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// watchIPNBus pumps one watch until it breaks.
+func (h *host) watchIPNBus(wc busWatcher) {
 	h.mu.Lock()
 	h.watchDead = false
 	h.mu.Unlock()
@@ -592,7 +655,7 @@ func (h *host) watchIPNBus(wc *tailscale.IPNBusWatcher) {
 	}
 }
 
-func (h *host) updateFromWatcher(wc *tailscale.IPNBusWatcher) bool {
+func (h *host) updateFromWatcher(wc busWatcher) bool {
 	n, err := wc.Next()
 
 	defer h.sendStatus()

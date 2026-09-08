@@ -17,6 +17,8 @@
   },
   "permissions": [
     "proxy",
+    "alarms",
+    "idle",
     "storage",
     "nativeMessaging"
   ],

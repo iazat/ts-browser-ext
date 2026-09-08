@@ -218,6 +218,23 @@ for (const target of TARGETS) {
       }
     });
 
+    // A backend that has answered before is installed, so a dead port after
+    // that is a restart — a machine waking from sleep, nearly always. Printing
+    // the install command there reads as "your extension is broken", which is
+    // the moment people go looking for what they did wrong.
+    test("says it is reconnecting rather than asking for a fresh install", async () => {
+      const { page } = await open(target, { reconnecting: true });
+      assert.equal((await page.textContent("#state")).trim(), "Reconnecting…");
+      assert.equal(
+        await page.$("#state pre"),
+        null,
+        "printed an install command for a backend that is merely restarting"
+      );
+      const cls = await page.getAttribute(".slider", "class");
+      assert.ok(cls.includes("loading"), `expected the spinner while it reconnects, got ${cls}`);
+      await page.close();
+    });
+
     test("a genuine error is still surfaced", async () => {
       const { page } = await open(target, { status: { error: "something broke" } });
       const text = await page.textContent("#state");

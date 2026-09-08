@@ -148,6 +148,15 @@ document.addEventListener("DOMContentLoaded", () => {
       return;
     }
 
+    if (msg.reconnecting) {
+      // The backend is installed and coming back — after a sleep, most likely.
+      // Saying so beats printing an install command at someone who installed it
+      // months ago.
+      stateDisplay.textContent = "Reconnecting…";
+      isLoading = true;
+      updateSliderState();
+      return;
+    }
     if (msg.installCmd) {
       console.log("Received install command");
       stateDisplay.innerHTML = `<b>Installation needed. Run:</b><pre>${msg.installCmd}</pre>`;

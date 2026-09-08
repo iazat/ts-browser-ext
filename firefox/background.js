@@ -63,6 +63,50 @@ function clearBrowserProxy() {
     });
 }
 
+// stopBrowserProxy hands browsing back to a direct connection without telling
+// the backend anything. Use it when the backend is itself the one reporting
+// that it is not routing: sending "down" there would switch off a profile the
+// user never switched off, and it would stay off across restarts.
+function stopBrowserProxy() {
+  proxyEnabled = false;
+  lastProxyPort = 0;
+  clearBrowserProxy();
+}
+
+// proxyWanted is what the user last asked of the toggle: true, false, or null
+// when they have not touched it since this script started. Null is the normal
+// state after a wake from sleep, and it is why the backend gets the last word
+// then.
+let proxyWanted = null;
+
+// syncProxyToBackend routes the browser through the native proxy exactly while
+// the backend says it is running, and hands browsing back the rest of the time.
+//
+// The backend is the side that remembers. Its preferences are on disk, so it
+// comes back from a restart connected or switched off, whichever the user left
+// it; everything this script knows lives in a worker the browser throws away.
+// So after a wake the browser's proxy follows the backend rather than the other
+// way round — unless the user has just asked for a state the backend has not
+// reached yet, where the request is the newer fact.
+function syncProxyToBackend(status) {
+  const running = !!(status && status.running);
+  if (running) {
+    if (
+      proxyWanted !== false &&
+      nativeProxyPort &&
+      (!proxyEnabled || lastProxyPort !== nativeProxyPort)
+    ) {
+      console.log("Backend is running; routing the browser through it");
+      setProxy(nativeProxyPort);
+    }
+    return;
+  }
+  if (proxyEnabled && proxyWanted !== true) {
+    console.log("Backend is not routing; handing browsing back to direct");
+    stopBrowserProxy();
+  }
+}
+
 function disableProxy() {
   console.log("disableProxy called");
   if (nmPort && !deadPort) {
@@ -76,9 +120,7 @@ function disableProxy() {
       deadPort
     );
   }
-  proxyEnabled = false;
-  lastProxyPort = 0;
-  clearBrowserProxy();
+  stopBrowserProxy();
   console.log(
     "Proxy disabled, proxyEnabled:",
     proxyEnabled,
@@ -114,6 +156,8 @@ browser.runtime.onConnect.addListener((port) => {
   // change (e.g. login completing) that happened while it was closed.
   if (nmPort && !deadPort) {
     nmPort.postMessage({ cmd: "get-status" });
+  } else {
+    reconnectNow("popup opened");
   }
 });
 
@@ -142,6 +186,15 @@ function sendPopupStatus() {
 
   if (deadPort) {
     setPopupIcon("need-install");
+    // A backend that has answered before is installed, so a dead port here
+    // means it is being restarted, not missing. Give up on that story once the
+    // reconnects keep failing, because by then it may really be gone — someone
+    // ran --uninstall, or the browser cannot launch it any more.
+    if (hostSeen && failedConnects <= 3) {
+      console.log("sendPopupStatus... reconnecting to the native host");
+      sendToPopup({ reconnecting: true });
+      return;
+    }
     console.log("sendPopupStatus... no nmPort");
     sendToPopup({
       installCmd:
@@ -166,28 +219,122 @@ let nmPort = null; // even non-null if lacking permission
 let deadPort = true;
 let portError = null;
 
+// Reconnect policy for the native messaging host.
+//
+// The host is a child process of the browser and dies with the port that
+// carries it. On a Mac that happens every time the machine sleeps: the browser
+// suspends, the worker running this script is discarded, and the backend goes
+// with it. Coming back has to be automatic, because the alternative is what
+// this did before — wait for someone to open the popup, which is to say wait
+// for the user to find out the extension has been dead since the lid closed.
+const retryMinMs = 1000;
+const retryMaxMs = 30000;
+let retryDelayMs = retryMinMs;
+let retryTimer = null;
+
+// failedConnects counts disconnects since the last message from a host. It
+// separates "the machine just woke up" from "no backend is installed", which
+// look identical from here and call for opposite things to be said.
+let failedConnects = 0;
+
+// reconnectAlarmName names an alarm rather than a timer because a timer only
+// exists while this script does. The browser discards the worker when it goes
+// idle and suspends everything when the machine sleeps; an alarm is held by
+// the browser, which starts the worker again to deliver it. That is the
+// difference between recovering by itself and waiting to be noticed.
+const reconnectAlarmName = "reconnect-native-host";
+
+// hostSeen records that a backend has answered in this profile at least once.
+// Until then a dead port means it was never installed, and the popup prints the
+// command that installs it. After it, the same dead port almost always means
+// the machine woke up a second ago — and telling people to install what they
+// already have is how an ordinary reconnect reads as a broken extension.
+let hostSeen = false;
+
+function rememberHostSeen() {
+  if (hostSeen) {
+    return;
+  }
+  hostSeen = true;
+  browser.storage.local.set({ hostSeen: true });
+}
+
+// connectingSince guards against starting a second backend on top of one that
+// has not answered yet. Several things can ask for a reconnect at once — an
+// alarm landing on top of a retry, someone opening the popup — and every
+// connectNative starts another process. It expires, because a host that never
+// answers at all still has to be retried.
+const connectStallMs = 5000;
+let connectingSince = 0;
+
+function scheduleReconnect() {
+  if (retryTimer !== null) {
+    return; // an attempt is already pending
+  }
+  console.log("Reconnecting to the native host in " + retryDelayMs + "ms");
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    connectToNativeHost();
+  }, retryDelayMs);
+  retryDelayMs = Math.min(retryDelayMs * 2, retryMaxMs);
+}
+
+// reconnectNow tries again straight away, dropping whatever backoff has built
+// up. Its callers are the events that mean the machine is back and someone is
+// about to browse; sitting out a 30 second delay then is pure lost time.
+function reconnectNow(why) {
+  if (!deadPort) {
+    return;
+  }
+  console.log("Reconnecting to the native host now: " + why);
+  if (retryTimer !== null) {
+    clearTimeout(retryTimer);
+    retryTimer = null;
+  }
+  retryDelayMs = retryMinMs;
+  connectToNativeHost();
+}
+
 connectToNativeHost();
 
 function connectToNativeHost() {
   if (nmPort && !deadPort) {
     return;
   }
+  if (connectingSince && Date.now() - connectingSince < connectStallMs) {
+    console.log("A native host is already starting; not starting another");
+    return;
+  }
+  connectingSince = Date.now();
   console.log("Connecting to native messaging host...");
   nmPort = browser.runtime.connectNative("io.github.iazat.tailext.firefox");
 
   nmPort.onDisconnect.addListener(() => {
     deadPort = true;
+    connectingSince = 0;
     nativeProxyPort = 0; // the host is gone, and so is the port it was listening on
+    // The next host is a new process with no tsnet running in it, so it needs
+    // the init this one already had. Leaving this set made reconnecting worse
+    // than staying down: the extension pointed the browser at a backend that
+    // had never been told to start, and every page load failed against a proxy
+    // with no tailnet behind it.
+    didInit = false;
+    failedConnects++;
     setPopupIcon("need-install");
     disableProxy();
     const error = browser.runtime.lastError;
     if (error) {
       console.error("Connection failed:", error.message);
       portError = error.message;
-      setTimeout(connectToNativeHost, 1000);
     } else {
       console.error("Disconnected from native host");
     }
+    // Retry either way. A host that exits by itself reports no lastError at
+    // all, and that is exactly the disconnect a sleeping machine produces —
+    // the old code retried only the other kind, so a wake left the extension
+    // down until something else happened to restart this script.
+    scheduleReconnect();
+    sendPopupStatus();
   });
   nmPort.onMessage.addListener((message) => {
     console.log("got message: " + JSON.stringify(message));
@@ -195,10 +342,22 @@ function connectToNativeHost() {
       console.log("connected to native backend");
       deadPort = false;
     }
+    connectingSince = 0;
+    retryDelayMs = retryMinMs;
+    failedConnects = 0;
+    rememberHostSeen();
     if (message.procRunning) {
       if (message.procRunning.port) {
         nativeProxyPort = message.procRunning.port;
-        setProxy(message.procRunning.port);
+        // Whether to route the browser through it is the next status message's
+        // call, not this one's: the backend's preferences are on disk and
+        // remember whether this profile was left connected, while a worker that
+        // has just started remembers nothing. Routing on sight is what switched
+        // the tailnet back on for people who had switched it off, and pointed
+        // the browser into a backend that was still stopped.
+        if (proxyWanted === true) {
+          setProxy(message.procRunning.port);
+        }
       } else if (message.procRunning.errror) {
         console.log(
           "procRunning error from backend: " + message.procRunning.err
@@ -212,6 +371,7 @@ function connectToNativeHost() {
     }
     if (message.status) {
       lastStatus = message.status;
+      syncProxyToBackend(message.status);
     }
     maybeSendInit();
     sendPopupStatus();
@@ -278,7 +438,8 @@ function maybeSendInit() {
   didInit = true;
 }
 
-browser.storage.local.get("profileId").then((result) => {
+browser.storage.local.get(["profileId", "hostSeen"]).then((result) => {
+  hostSeen = hostSeen || !!result.hostSeen;
   if (!result.profileId) {
     const profileId = crypto.randomUUID();
     browser.storage.local.set({ profileId }).then(() => {
@@ -305,6 +466,7 @@ browser.runtime.onMessage.addListener((message, sender) => {
   if (message.command === "toggleProxy") {
     console.log("bg: toggleProxy received, current proxy=" + proxyEnabled);
     proxyEnabled = !proxyEnabled;
+    proxyWanted = proxyEnabled; // an explicit request outranks the backend
     let response;
     if (proxyEnabled) {
       console.log("bg: Enabling proxy");
@@ -318,4 +480,31 @@ browser.runtime.onMessage.addListener((message, sender) => {
     setPopupIcon(proxyEnabled);
     return Promise.resolve(response);
   }
+});
+
+// Everything that means "the machine is back".
+//
+// A wake from sleep arrives as some combination of these: this script is
+// started fresh, idle flips back to active, and any alarm that came due while
+// the machine was off is delivered late. Each one does nothing unless the port
+// is actually dead, so they cost nothing while the backend is healthy.
+browser.alarms.create(reconnectAlarmName, { periodInMinutes: 1 });
+
+browser.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === reconnectAlarmName) {
+    reconnectNow("alarm");
+  }
+});
+
+browser.idle.onStateChanged.addListener((state) => {
+  // "active" is the machine coming back — from sleep, from the lock screen, or
+  // from a coffee. It is the earliest word we get that someone is about to
+  // load a page, which is when a dead backend starts to matter.
+  if (state === "active") {
+    reconnectNow("idle state " + state);
+  }
+});
+
+browser.runtime.onStartup.addListener(() => {
+  reconnectNow("browser startup");
 });
