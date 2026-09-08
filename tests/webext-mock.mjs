@@ -178,16 +178,25 @@ export function plain(v) {
   return v === null || typeof v !== "object" ? v : { ...v };
 }
 
-// connectPopup simulates the popup opening and returns the messages it is sent.
+// connectPopup simulates a popup opening. The returned port collects what that
+// particular popup was sent in `received`, so a test can tell two open popups
+// apart — popup.html can be open in a tab and in the toolbar panel at once.
 export function connectPopup(calls) {
+  const received = [];
   const port = {
     name: "popup",
+    received,
     onMessage: { addListener() {} },
-    onDisconnect: { addListener() {} },
-    postMessage: (m) => calls.toPopup.push(m),
+    onDisconnect: { addListener: (f) => (port.fireDisconnect = f) },
+    postMessage: (m) => (received.push(m), calls.toPopup.push(m)),
   };
   calls.onConnect(port);
   return port;
+}
+
+// closePopup is that popup being closed.
+export function closePopup(port) {
+  if (port.fireDisconnect) port.fireDisconnect();
 }
 
 // sendCommand delivers a popup command and normalizes the two reply styles

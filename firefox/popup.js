@@ -54,6 +54,28 @@ document.addEventListener("DOMContentLoaded", () => {
 
   const port = browser.runtime.connect({ name: "popup" });
 
+  // Paint what was last true before the background gets a chance to answer.
+  // The browser discards the worker the background runs in, and the native
+  // backend — its child process — dies with it, so opening this panel can mean
+  // waiting out a whole new backend starting Tailscale from cold. Those
+  // seconds spent blank read as an extension that is broken rather than one
+  // that is catching up. The spinner stays until something live arrives, so
+  // what is on screen is shown as what it is: the last thing known.
+  browser.storage.local
+    .get("lastStatus")
+    .then((cached) => {
+      if (!cached || !cached.lastStatus || hasReceivedInitialState) {
+        return; // nothing cached, or the live answer got here first
+      }
+      updateStatus(cached.lastStatus);
+      isLoading = true; // provisional until the background confirms it
+      hasReceivedInitialState = false;
+      updateSliderState();
+    })
+    .catch((error) => {
+      console.error("reading the cached status:", error && error.message);
+    });
+
   function updateSliderState() {
     if (isLoading) {
       slider.className = "slider loading";

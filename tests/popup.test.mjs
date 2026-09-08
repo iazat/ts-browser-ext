@@ -38,6 +38,15 @@ const backgroundStub = (api) => `
       },
     },
     tabs: { create: (o) => window.__sent.push({ tabCreate: o.url }) },
+    storage: {
+      local: {
+        get: (key, cb) => {
+          const value = window.__cachedStatus ? { lastStatus: window.__cachedStatus } : {};
+          if (typeof cb === "function") { cb(value); return undefined; }
+          return Promise.resolve(value);
+        },
+      },
+    },
   };
 `;
 
@@ -70,7 +79,7 @@ after(async () => {
 
 // open loads a popup with the background stubbed out, blocks every non-local
 // request, and hands back the page plus anything it tried to fetch remotely.
-async function open(target, message) {
+async function open(target, message, cachedStatus) {
   const page = await browser.newPage({ viewport: { width: 360, height: 600 } });
   const remote = [];
   const failures = [];
@@ -84,6 +93,9 @@ async function open(target, message) {
   });
   page.on("pageerror", (e) => failures.push(String(e.message)));
   await page.addInitScript(backgroundStub(target.api));
+  if (cachedStatus) {
+    await page.addInitScript(`window.__cachedStatus = ${JSON.stringify(cachedStatus)};`);
+  }
   await page.goto("file://" + path.join(target.dir, "popup.html"));
   if (message) await page.evaluate((m) => window.__push(m), message);
   await page.waitForFunction(() => document.readyState === "complete");
@@ -245,6 +257,37 @@ for (const target of TARGETS) {
       assert.equal((await page.textContent("#state")).trim(), "Connecting…");
       const cls = await page.getAttribute(".slider", "class");
       assert.ok(cls.includes("loading"), `expected the spinner, got ${cls}`);
+      await page.close();
+    });
+
+    // Opening the panel can mean waiting out a backend that has to start
+    // Tailscale from cold, because the browser discarded the worker and took
+    // the backend down with it. The wait cannot be shortened from here, but it
+    // does not have to be spent staring at nothing.
+    test("paints the last known state before the background answers", async () => {
+      const { page } = await open(target, null, {
+        running: true,
+        tailnet: "test@example.com",
+      });
+
+      assert.equal((await page.textContent("#state")).trim(), "Connected as test@example.com");
+      const cls = await page.getAttribute(".slider", "class");
+      assert.ok(
+        cls.includes("loading"),
+        `the cached state must stay visibly provisional until confirmed, got ${cls}`
+      );
+      await page.close();
+    });
+
+    test("a live status replaces the cached one", async () => {
+      const { page } = await open(target, { status: { running: false } }, {
+        running: true,
+        tailnet: "test@example.com",
+      });
+
+      assert.equal((await page.textContent("#state")).trim(), "Disconnected");
+      const cls = await page.getAttribute(".slider", "class");
+      assert.ok(!cls.includes("loading"), `expected a settled slider, got ${cls}`);
       await page.close();
     });
 

@@ -197,9 +197,19 @@ WebExtension API — proxy lifecycle, the commands the popup sends, and the
 messages that reach the native host. `tests/popup.test.mjs` renders both
 popups in Chromium and drives them through their states. The popup suite runs
 in Chromium even for the Firefox copy: the markup, CSS and `popup.js` logic
-are shared, so that is what it covers. Firefox's `proxy.onRequest` and
-native-messaging integration still needs a real Firefox via
-`about:debugging`.
+are shared, so that is what it covers.
+
+`tests/e2e.test.mjs` is the one that does not mock the browser. It loads the
+Chrome extension into Chromium, registers `tests/fake-backend.mjs` as a native
+messaging host — same protocol as the Go one, no tailnet and no login — then
+kills that backend and checks the extension brings another one back,
+initialises it under the same profile id, and routes the browser through it
+again. That is the sequence a sleeping laptop produces, and mocks cannot reach
+it: they hand out the same port object on every connect and never discard a
+worker. Everything it writes lives in a throwaway profile directory.
+
+Firefox's `proxy.onRequest` and native-messaging integration still needs a real
+Firefox via `about:debugging`.
 
 If you have a Chromium that playwright didn't install, point at it with
 `CHROMIUM_PATH=/path/to/chromium npm test`.

@@ -158,13 +158,17 @@ function disableProxy() {
 
 console.log("starting ts-browser-ext");
 
-let popupPort = null;
+// Every popup that is currently open. It used to be a single port, so opening
+// the panel while popup.html was also open in a tab left the tab frozen on
+// whatever it had rendered first — it went on showing "None" for an exit node
+// that had since been chosen, with nothing to suggest it was stale.
+let popupPorts = new Set();
 
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name != "popup") {
     return;
   }
-  popupPort = port;
+  popupPorts.add(port);
 
   console.log("Popup connected");
 
@@ -174,7 +178,7 @@ chrome.runtime.onConnect.addListener((port) => {
 
   port.onDisconnect.addListener(() => {
     console.log("Popup disconnected");
-    popupPort = null;
+    popupPorts.delete(port);
   });
 
   sendPopupStatus();
@@ -227,9 +231,34 @@ function sendPopupStatus() {
   sendToPopup({ status: lastStatus });
 }
 
+// rememberStatus keeps the last status where a popup can read it without this
+// script being awake at all.
+//
+// The browser discards this worker, and the backend — its child process — dies
+// with it, so opening the popup can mean waiting out a new backend starting
+// Tailscale from cold. The popup has no way to shorten that wait, but it does
+// not have to spend it blank: storage is readable from the popup directly, so
+// it can paint what was last true and keep its spinner until this script
+// confirms or corrects it.
+function rememberStatus(status) {
+  chrome.storage.local.set({ lastStatus: status }, () => {
+    const error = chrome.runtime.lastError;
+    if (error) {
+      // Only costs the next popup its head start.
+      console.error("caching the last status:", error.message);
+    }
+  });
+}
+
 function sendToPopup(v) {
-  if (popupPort) {
-    popupPort.postMessage(v);
+  for (const port of popupPorts) {
+    try {
+      port.postMessage(v);
+    } catch (error) {
+      // A popup that closed between the check and the post. Nothing to do
+      // about it, and nothing worth telling anyone.
+      popupPorts.delete(port);
+    }
   }
 }
 
@@ -436,6 +465,7 @@ function connectToNativeHost() {
     }
     if (message.status) {
       lastStatus = message.status;
+      rememberStatus(message.status);
       syncProxyToBackend(message.status);
     }
     maybeSendInit();

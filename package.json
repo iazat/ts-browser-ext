@@ -6,6 +6,7 @@
     "test": "node --test tests/*.test.mjs",
     "test:background": "node --test tests/background.test.mjs",
     "test:popup": "node --test tests/popup.test.mjs",
+    "test:e2e": "node --test tests/e2e.test.mjs",
     "icons": "node script/icons.mjs",
     "screenshots": "node script/screenshots.mjs"
   },

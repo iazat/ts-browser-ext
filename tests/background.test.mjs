@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import {
   loadBackground,
   connectPopup,
+  closePopup,
   sendCommand,
   plain,
   runTimers,
@@ -180,6 +181,53 @@ for (const target of TARGETS) {
         !target.isProxied(calls),
         "pointed the browser at a port whose listener no longer exists"
       );
+    });
+
+    // Opening the popup can mean waiting out a backend starting Tailscale from
+    // cold, because the browser discarded this script's worker and took the
+    // backend down with it. The popup cannot shorten that, but it can read the
+    // last status out of storage and paint it while it waits.
+    test("caches the last status where a popup can read it unaided", () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+
+      bringUp(calls);
+
+      assert.deepEqual(plain(calls.storage.lastStatus), {
+        running: true,
+        tailnet: "test@example.com",
+      });
+    });
+
+    // popup.html can be open in a tab and in the toolbar panel at the same
+    // time. Holding one port meant the first one froze on whatever it had
+    // rendered — showing "None" for an exit node that had since been chosen.
+    test("keeps every open popup up to date", () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      bringUp(calls);
+      const tab = connectPopup(calls);
+      const panel = connectPopup(calls);
+      tab.received.length = 0;
+      panel.received.length = 0;
+
+      calls.onNativeMessage({ status: { running: false, error: "State: Stopped" } });
+
+      assert.ok(tab.received.some((m) => m.status), "the popup opened first stopped being told anything");
+      assert.ok(panel.received.some((m) => m.status), "the popup opened second was never told anything");
+    });
+
+    test("stops writing to a popup that has closed", () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      bringUp(calls);
+      const tab = connectPopup(calls);
+      const panel = connectPopup(calls);
+      closePopup(tab);
+      tab.received.length = 0;
+      panel.received.length = 0;
+
+      calls.onNativeMessage({ status: { running: false, error: "State: Stopped" } });
+
+      assert.equal(tab.received.length, 0, "kept posting to a popup that is gone");
+      assert.ok(panel.received.some((m) => m.status), "the popup still open was left stale");
     });
 
     // The backend sends a status per notification and a live tailnet is never
