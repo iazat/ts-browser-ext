@@ -79,8 +79,14 @@ function stopBrowserProxy() {
 // then.
 let proxyWanted = null;
 
-// syncProxyToBackend routes the browser through the native proxy exactly while
-// the backend says it is running, and hands browsing back the rest of the time.
+// isStopped reports whether the backend says this profile is switched off, as
+// against still on its way up. The backend reports the state in an error
+// string; popup.js reads the same shape to decide what to print.
+function isStopped(status) {
+  return !!status && status.error === "State: Stopped";
+}
+
+// syncProxyToBackend keeps the browser's proxy in step with the backend.
 //
 // The backend is the side that remembers. Its preferences are on disk, so it
 // comes back from a restart connected or switched off, whichever the user left
@@ -88,22 +94,36 @@ let proxyWanted = null;
 // So after a wake the browser's proxy follows the backend rather than the other
 // way round — unless the user has just asked for a state the backend has not
 // reached yet, where the request is the newer fact.
+//
+// Stopped is the only state that means direct browsing. Every other state
+// short of running — NoState, Starting, waiting on device approval — is a
+// connection coming up, and two things go wrong if the browser is left out of
+// the proxy through those. The browser keeps a proxy setting across a restart
+// of this script, so it goes on addressing the port the last backend listened
+// on, which nothing answers any more; and where an exit node is configured,
+// whatever does get through leaves from this machine's own address instead,
+// seconds at a time and invisibly afterwards. Pointing at the new backend
+// fails closed on both counts: it refuses to dial until dialling is safe (see
+// safeToDial in the Go host).
 function syncProxyToBackend(status) {
-  const running = !!(status && status.running);
-  if (running) {
-    if (
-      proxyWanted !== false &&
-      nativeProxyPort &&
-      (!proxyEnabled || lastProxyPort !== nativeProxyPort)
-    ) {
-      console.log("Backend is running; routing the browser through it");
-      setProxy(nativeProxyPort);
+  if (isStopped(status)) {
+    if (proxyEnabled && proxyWanted !== true) {
+      console.log("Backend is stopped; handing browsing back to direct");
+      stopBrowserProxy();
     }
     return;
   }
-  if (proxyEnabled && proxyWanted !== true) {
-    console.log("Backend is not routing; handing browsing back to direct");
-    stopBrowserProxy();
+  if (proxyWanted === false || !nativeProxyPort) {
+    return;
+  }
+  if (!proxyEnabled || lastProxyPort !== nativeProxyPort) {
+    console.log(
+      status && status.running
+        ? "Backend is running; routing the browser through it"
+        : "Backend is coming up; routing the browser through it rather than " +
+            "leaving it on a port nothing is listening on"
+    );
+    setProxy(nativeProxyPort);
   }
 }
 

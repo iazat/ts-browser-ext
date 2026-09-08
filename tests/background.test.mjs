@@ -488,14 +488,50 @@ for (const target of TARGETS) {
     // as the user left it; this script's own state lives in a worker the
     // browser throws away.
     describe("state after a reconnect", () => {
-      test("does not route the browser into a backend that is not running", () => {
+      test("a port on its own is not a reason to route anything", () => {
         const { calls } = loadBackground(target.file, target.flavor);
 
         calls.onNativeMessage({ procRunning: { port: 41234 } });
 
         assert.ok(
           !target.isProxied(calls),
-          "pointed the browser at a proxy before the backend said it was routing anything"
+          "routed the browser before the backend had said a word about its state"
+        );
+      });
+
+      // The browser keeps its proxy setting across a restart of the background
+      // script, so between a wake and the new backend reaching Running it is
+      // still addressing the port the last one listened on — where nothing
+      // answers. And with an exit node configured, anything that does get out
+      // in that window leaves from this machine's own address. Both are why
+      // "not running yet" is not a reason to stand aside: the new backend
+      // refuses to dial until it is safe, which is the failure we want.
+      test("routes at a backend that is still coming up", () => {
+        const { calls } = loadBackground(target.file, target.flavor);
+
+        calls.onNativeMessage({ procRunning: { port: 41234 } });
+        calls.onNativeMessage({ status: { running: false, error: "State: Starting" } });
+
+        assert.ok(
+          target.isProxied(calls),
+          "left the browser out of the proxy while the backend was starting"
+        );
+      });
+
+      test("moves to the new port when the backend has been replaced", () => {
+        const { sandbox, calls } = loadBackground(target.file, target.flavor);
+        bringUp(calls, 41234);
+        calls.onNativeDisconnect();
+        runTimers(calls);
+
+        // The replacement listens somewhere else: the kernel picks the port.
+        calls.onNativeMessage({ procRunning: { port: 41235 }, status: { running: true } });
+
+        assert.ok(target.isProxied(calls), "the browser is not going through the new backend");
+        assert.equal(
+          sandbox.lastProxyPort,
+          41235,
+          "still addressing the port the backend that died was listening on"
         );
       });
 
