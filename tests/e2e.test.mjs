@@ -78,12 +78,17 @@ describe("chrome: end to end, against a stand-in backend", () => {
       })
     );
 
+    // The headless shell playwright reaches for by default cannot load
+    // extensions at all; "chromium" asks for the full build, whose headless
+    // mode can. An explicit CHROMIUM_PATH wins, and the two are exclusive.
+    const usingOwnBrowser = Boolean(process.env.CHROMIUM_PATH);
     let ctx;
     try {
       ctx = await chromium.launchPersistentContext(userDataDir, {
+        channel: usingOwnBrowser ? undefined : "chromium",
         executablePath: process.env.CHROMIUM_PATH || undefined,
+        headless: true,
         args: [
-          "--headless=new",
           `--disable-extensions-except=${ROOT}`,
           `--load-extension=${ROOT}`,
           "--no-sandbox",
@@ -96,11 +101,27 @@ describe("chrome: end to end, against a stand-in backend", () => {
         },
       });
     } catch (err) {
+      fs.rmSync(tmp, { recursive: true, force: true });
       t.skip(`could not launch a browser with extensions: ${err.message}`);
       return;
     }
 
     try {
+      // Prove the extension is loaded before insisting on its worker. A browser
+      // that cannot load extensions is this machine's problem and worth
+      // skipping over; a worker that will not start is the bug this test is
+      // here for, and must not be confused with it.
+      const probe = await ctx.newPage();
+      const extensionLoads = await probe
+        .goto(`chrome-extension://${unpackedExtensionId(ROOT)}/popup.html`)
+        .then(() => true)
+        .catch(() => false);
+      await probe.close();
+      if (!extensionLoads) {
+        t.skip("this browser build does not load extensions");
+        return;
+      }
+
       const sw =
         ctx.serviceWorkers()[0] || (await ctx.waitForEvent("serviceworker", { timeout: 30000 }));
 
