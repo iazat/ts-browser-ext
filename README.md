@@ -65,6 +65,12 @@ Most of these predate the fork:
   the backend (up to 20 s) rather than failing on the spot, and CONNECT dials
   have a deadline (30 s) so an exit node that has gone quiet cannot leave a
   tab spinning indefinitely.
+- **The exit node reset to None on every restart.** tsnet starts the backend
+  with a fresh set of preferences, and Tailscale takes that as the whole set,
+  so every browser start and every reload of the extension silently dropped
+  the exit node while traffic left through this machine. The choice is now
+  kept beside the profile's state and put back right after start, before the
+  browser is allowed to dial.
 - **The connect toggle only worked once.** Turning the extension off left the
   browser on a direct connection, and turning it back on never restored the
   proxy — the only way back was reloading the extension.

@@ -11,10 +11,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"tailscale.com/ipn"
+	"tailscale.com/tailcfg"
 )
 
 // frame encodes one native messaging frame the way the browser would send it.
@@ -260,5 +266,75 @@ func TestCmdErrorReplyNamesTheCommand(t *testing.T) {
 	}
 	if got := fmt.Sprint(frames[0].CmdError.Cmd); got != "down" {
 		t.Errorf("cmd = %q, want %q", got, "down")
+	}
+}
+
+// tsnet starts the backend with a fresh set of preferences every time, and
+// Tailscale takes that as the whole set: the exit node was wiped on every
+// restart of this process, which is every browser start and every reload of
+// the extension. The choice is kept beside the state and put back on start.
+func TestSavedExitNodeRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), savedExitNodeFile)
+
+	// Nothing recorded yet: nothing to restore, and no error.
+	s, err := readSavedExitNode(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.isSet() {
+		t.Fatalf("read %+v from a missing file, want nothing set", s)
+	}
+
+	// A node resolved to its stable id.
+	const id = tailcfg.StableNodeID("nodeABC")
+	if err := writeSavedExitNode(path, &ipn.Prefs{ExitNodeID: id}); err != nil {
+		t.Fatal(err)
+	}
+	s, err = readSavedExitNode(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.ID != id || s.IP.IsValid() {
+		t.Fatalf("got %+v, want id %q and no ip", s, id)
+	}
+	mp := s.maskedPrefs()
+	if !mp.ExitNodeIDSet || !mp.ExitNodeIPSet || mp.Prefs.ExitNodeID != id {
+		t.Fatalf("maskedPrefs = %+v, want both fields masked and the id set", mp)
+	}
+
+	// A node still known only by IP, as it is before the netmap arrives.
+	ip := netip.MustParseAddr("100.96.115.109")
+	if err := writeSavedExitNode(path, &ipn.Prefs{ExitNodeIP: ip}); err != nil {
+		t.Fatal(err)
+	}
+	s, err = readSavedExitNode(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.ID != "" || s.IP != ip {
+		t.Fatalf("got %+v, want ip %v and no id", s, ip)
+	}
+
+	// Clearing the exit node must survive a restart too, or a choice of None
+	// would come back as the node before it.
+	if err := writeSavedExitNode(path, &ipn.Prefs{}); err != nil {
+		t.Fatal(err)
+	}
+	s, err = readSavedExitNode(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.isSet() {
+		t.Fatalf("got %+v after clearing, want nothing set", s)
+	}
+}
+
+func TestSavedExitNodeRejectsGarbage(t *testing.T) {
+	path := filepath.Join(t.TempDir(), savedExitNodeFile)
+	if err := os.WriteFile(path, []byte("{not json"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readSavedExitNode(path); err == nil {
+		t.Fatal("a corrupt file was read as a valid choice")
 	}
 }

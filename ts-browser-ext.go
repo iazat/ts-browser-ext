@@ -471,13 +471,117 @@ func (h *host) handleSetExitNode(msg *request) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), localAPITimeout)
 	defer cancel()
-	return applyExitNode(ctx, lc, msg.ExitNode)
+	return h.setExitNode(ctx, lc, msg.ExitNode)
+}
+
+// setExitNode applies the choice and remembers it for the next process.
+func (h *host) setExitNode(ctx context.Context, lc *local.Client, name string) error {
+	prefs, err := applyExitNode(ctx, lc, name)
+	if err != nil {
+		return err
+	}
+	if err := writeSavedExitNode(h.savedExitNodePath(), prefs); err != nil {
+		h.logf("remembering exit node: %v", err)
+	}
+	return nil
+}
+
+// savedExitNodeFile is where the chosen exit node is kept between processes,
+// beside tsnet's own state for the profile.
+//
+// It is needed because tsnet starts the backend with a fresh set of
+// preferences every time — hostname, WantRunning, the control URL — and
+// Tailscale takes that as the whole set, replacing what was stored. The exit
+// node went with it: every restart of this process, which is every browser
+// start and every reload of the extension, silently put the picker back to
+// None while the user's traffic left through this machine. The previous
+// process's choice is put back right after start, before the browser is
+// allowed to dial.
+const savedExitNodeFile = "exit-node.json"
+
+func (h *host) savedExitNodePath() string {
+	return filepath.Join(h.ts.Dir, savedExitNodeFile)
+}
+
+// savedExitNode is the on-disk form. Which of the two is set depends on how
+// far the backend had got: a node picked by name is stored as its IP until
+// the netmap lets the backend resolve it to a stable ID.
+type savedExitNode struct {
+	ID tailcfg.StableNodeID `json:"id,omitempty"`
+	IP netip.Addr           `json:"ip"`
+}
+
+func (s savedExitNode) isSet() bool {
+	return s.ID != "" || s.IP.IsValid()
+}
+
+// maskedPrefs is the edit that puts the saved choice back. Both fields are
+// masked so that whichever one is empty clears any stale value.
+func (s savedExitNode) maskedPrefs() *ipn.MaskedPrefs {
+	return &ipn.MaskedPrefs{
+		ExitNodeIDSet: true,
+		ExitNodeIPSet: true,
+		Prefs: ipn.Prefs{
+			ExitNodeID: s.ID,
+			ExitNodeIP: s.IP,
+		},
+	}
+}
+
+// writeSavedExitNode records the exit node in prefs at path. A choice of
+// none is recorded too, so that clearing the exit node also survives a
+// restart.
+func writeSavedExitNode(path string, prefs *ipn.Prefs) error {
+	b, err := json.Marshal(savedExitNode{ID: prefs.ExitNodeID, IP: prefs.ExitNodeIP})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0600)
+}
+
+// readSavedExitNode returns what writeSavedExitNode recorded, or a zero value
+// when nothing has been recorded yet.
+func readSavedExitNode(path string) (savedExitNode, error) {
+	b, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return savedExitNode{}, nil
+	}
+	if err != nil {
+		return savedExitNode{}, err
+	}
+	var s savedExitNode
+	if err := json.Unmarshal(b, &s); err != nil {
+		return savedExitNode{}, fmt.Errorf("parsing %s: %w", path, err)
+	}
+	return s, nil
+}
+
+// restoreExitNode puts back the exit node the previous process was using.
+// It must run before the IPN bus watcher subscribes: the initial prefs it
+// reports are what decide whether browser traffic may leave this machine,
+// and prefs read before the restore would say no exit node is configured.
+func (h *host) restoreExitNode(lc *local.Client) error {
+	s, err := readSavedExitNode(h.savedExitNodePath())
+	if err != nil {
+		return err
+	}
+	if !s.isSet() {
+		return nil
+	}
+	h.logf("restoring exit node id=%q ip=%v", s.ID, s.IP)
+	ctx, cancel := context.WithTimeout(context.Background(), localAPITimeout)
+	defer cancel()
+	if _, err := lc.EditPrefs(ctx, s.maskedPrefs()); err != nil {
+		return fmt.Errorf("EditPrefs: %w", err)
+	}
+	return nil
 }
 
 // applyExitNode sets (or, with an empty name, clears) the exit node. The name
 // is an IP or peer hostname/FQDN, resolved against the current status the same
 // way `tailscale set --exit-node` does.
-func applyExitNode(ctx context.Context, lc *local.Client, name string) error {
+// It returns the preferences as they stand after the edit.
+func applyExitNode(ctx context.Context, lc *local.Client, name string) (*ipn.Prefs, error) {
 	// Setting ExitNodeIDSet with an empty ID clears any stale ID so that the
 	// resolved ExitNodeIP takes effect; both zero clears the exit node entirely.
 	mp := &ipn.MaskedPrefs{
@@ -487,18 +591,19 @@ func applyExitNode(ctx context.Context, lc *local.Client, name string) error {
 	if name != "" {
 		st, err := lc.Status(ctx)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		var p ipn.Prefs
 		if err := p.SetExitNodeIP(name, st); err != nil {
-			return fmt.Errorf("resolving exit node %q: %w", name, err)
+			return nil, fmt.Errorf("resolving exit node %q: %w", name, err)
 		}
 		mp.Prefs.ExitNodeIP = p.ExitNodeIP
 	}
-	if _, err := lc.EditPrefs(ctx, mp); err != nil {
-		return fmt.Errorf("EditPrefs exit node: %w", err)
+	prefs, err := lc.EditPrefs(ctx, mp)
+	if err != nil {
+		return nil, fmt.Errorf("EditPrefs exit node: %w", err)
 	}
-	return nil
+	return prefs, nil
 }
 
 // isConfiguredExitNode reports whether a peer is the exit node this profile is
@@ -698,6 +803,11 @@ func (h *host) startTailscaleErr(ctx context.Context, id string) error {
 	lc, err := h.ts.LocalClient()
 	if err != nil {
 		return fmt.Errorf("getting local client: %w", err)
+	}
+	// Not fatal: a profile without its exit node is still a working profile,
+	// and the picker shows what happened.
+	if err := h.restoreExitNode(lc); err != nil {
+		h.logf("restoring exit node: %v", err)
 	}
 	go h.watchIPNBus(ctx, lc)
 	return nil
@@ -1251,7 +1361,7 @@ func (h *host) serveInternalSetExitNode(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	if err := applyExitNode(r.Context(), lc, body.ExitNode); err != nil {
+	if err := h.setExitNode(r.Context(), lc, body.ExitNode); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
