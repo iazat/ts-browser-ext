@@ -312,6 +312,33 @@ for (const target of TARGETS) {
       assert.equal(calls.connects, before + 1, "connectNative was not called again");
     });
 
+    // connectNative spawns the host, and its first message — the one that
+    // marks the port live — arrives some hundreds of milliseconds later. A
+    // reconnect timer firing in that window used to open a second host and
+    // abandon the first, still running, with the browser pointed at whichever
+    // reported its port last.
+    test("does not open a second host while the first is still starting", () => {
+      const { sandbox, calls } = loadBackground(target.file, target.flavor);
+      calls.onNativeDisconnect(); // the first attempt found no host
+      fireTimers(calls); // the reconnect spawns one
+      const after = calls.connects;
+
+      sandbox.connectToNativeHost(); // e.g. runtime.onStartup, or another timer
+      assert.equal(calls.connects, after, "a second host was spawned while the first was starting");
+
+      calls.onNativeMessage({ procRunning: { port: 41234 } });
+      sandbox.connectToNativeHost();
+      assert.equal(calls.connects, after, "a second host was spawned next to a live one");
+    });
+
+    test("connecting explicitly cancels a pending reconnect timer", () => {
+      const { sandbox, calls } = loadBackground(target.file, target.flavor);
+      calls.onNativeDisconnect();
+      assert.equal(calls.timers.length, 1);
+      sandbox.connectToNativeHost();
+      assert.equal(calls.timers.length, 0, "the timer would have spawned a second host");
+    });
+
     test("backs off between failed reconnects and resets once a host answers", () => {
       const { calls } = loadBackground(target.file, target.flavor);
       const delays = [];

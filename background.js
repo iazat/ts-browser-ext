@@ -170,7 +170,12 @@ function sendToPopup(v) {
 }
 
 let nmPort = null; // even non-null if lacking permission
+// deadPort means no live backend has answered on nmPort. It is only cleared
+// by a message, so it stays set while a freshly spawned host is still
+// starting; nmPortClosed is the narrower fact that the browser has reported
+// nmPort disconnected, which is what decides whether a new one may be opened.
 let deadPort = true;
+let nmPortClosed = true;
 let portError = null;
 // everConnected records that a native host answered at least once since this
 // worker started, which is what tells a restart apart from a missing install.
@@ -189,7 +194,7 @@ let reconnectDelay = reconnectDelayMin;
 let reconnectTimer = null;
 
 function scheduleReconnect() {
-  if (reconnectTimer !== null) {
+  if (reconnectTimer !== null || !nmPortClosed) {
     return;
   }
   console.log("Reconnecting to native host in " + reconnectDelay + "ms");
@@ -219,18 +224,29 @@ chrome.runtime.onInstalled.addListener(() => {
 });
 
 function connectToNativeHost() {
-  if (nmPort && !deadPort) {
+  // One host at a time. The old test here was "has a host answered", which
+  // is false for the first moments after connectNative while the new
+  // process is still starting — so a reconnect timer firing in that window
+  // opened a second host, and the first, never disconnected, ran on as an
+  // orphan with the browser pointed at whichever answered last.
+  if (nmPort && !nmPortClosed) {
     return;
+  }
+  if (reconnectTimer !== null) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
   }
   console.log("Connecting to native messaging host...");
   const port = chrome.runtime.connectNative("io.github.iazat.tailext.chrome");
   nmPort = port;
+  nmPortClosed = false;
 
   port.onDisconnect.addListener(() => {
     if (port !== nmPort) {
       // A port we already replaced; its news is stale.
       return;
     }
+    nmPortClosed = true;
     const error = chrome.runtime.lastError;
     deadPort = true;
     nativeProxyPort = 0; // the host is gone, and so is the port it was listening on

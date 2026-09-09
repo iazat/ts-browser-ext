@@ -111,7 +111,15 @@ export function loadBackground(file, flavor, extraGlobals = {}) {
     console: { log() {}, error() {}, warn() {} },
     // Timers are recorded, not run: a test that wants one to fire calls
     // its fn itself, so reconnect scheduling can be asserted without waiting.
-    setTimeout: (fn, ms) => calls.timers.push({ fn, ms }),
+    setTimeout: (fn, ms) => {
+      const t = { fn, ms };
+      calls.timers.push(t);
+      return t;
+    },
+    clearTimeout: (t) => {
+      const i = calls.timers.indexOf(t);
+      if (i !== -1) calls.timers.splice(i, 1);
+    },
     crypto: { randomUUID: () => "test-uuid" },
     URL,
     Promise,

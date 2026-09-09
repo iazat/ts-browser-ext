@@ -7,7 +7,8 @@
     "test:background": "node --test tests/background.test.mjs",
     "test:popup": "node --test tests/popup.test.mjs",
     "icons": "node script/icons.mjs",
-    "screenshots": "node script/screenshots.mjs"
+    "screenshots": "node script/screenshots.mjs",
+    "test:e2e": "node tests/e2e-chromium.mjs"
   },
   "devDependencies": {
     "playwright": "^1.62.0"

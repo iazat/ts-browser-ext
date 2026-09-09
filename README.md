@@ -223,6 +223,22 @@ native-messaging integration still needs a real Firefox via
 If you have a Chromium that playwright didn't install, point at it with
 `CHROMIUM_PATH=/path/to/chromium npm test`.
 
+One more suite is run by hand, not by `npm test`:
+
+```sh
+npm run test:e2e
+```
+
+`tests/e2e-chromium.mjs` builds the Go backend, loads the real Chrome
+extension into a real Chromium, registers the backend for it the way
+`--install` does, and then kills the backend with SIGKILL and checks that the
+extension recovers on its own: a replacement is started and sent `init`, the
+popup says it is reconnecting meanwhile, the browser's proxy is re-pointed at
+the new port, and exactly one backend is left running. It needs Linux paths
+and takes about ten seconds; `EXT_DIR` and `HOST_BIN` point it at another
+build, which is how the pre-fix behaviour was confirmed against the same
+script.
+
 ## Releases
 
 Tags are `vX.Y.Z` — Go requires the `v` and all three components to resolve
