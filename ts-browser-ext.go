@@ -108,20 +108,26 @@ extension's own ID:
 	h := newHost(os.Stdin, os.Stdout)
 
 	// Running under the browser, stdout is the protocol and stderr goes
-	// nowhere anyone looks. Log to a file beside the state instead, or to a
-	// local syslog when one is listening (the original debugging setup).
-	if w, err := dialDebugSyslog(); err == nil {
-		log.Printf("syslog dialed")
-		h.logf = func(f string, a ...any) {
-			fmt.Fprintf(w, f, a...)
-		}
-		log.SetOutput(w)
-	} else if w, path, err := openLogFile(); err == nil {
-		log.SetOutput(w)
-		log.Printf("ts-browser-ext pid %d logging to %s", os.Getpid(), path)
+	// nowhere anyone looks. Log to a file beside the state, always; and also
+	// to a local syslog when one is listening, the original debugging setup.
+	// The file used to be skipped when syslog answered, and anything that
+	// happens to listen on that port — it is a popular one — silently took
+	// the log with it.
+	var sinks []io.Writer
+	logPath := "(none)"
+	if w, path, err := openLogFile(); err == nil {
+		sinks = append(sinks, w)
+		logPath = path
 	} else {
 		log.Printf("log file: %v", err)
 	}
+	if w, err := dialDebugSyslog(); err == nil {
+		sinks = append(sinks, w)
+	}
+	if len(sinks) > 0 {
+		log.SetOutput(io.MultiWriter(sinks...))
+	}
+	log.Printf("ts-browser-ext pid %d logging to %s", os.Getpid(), logPath)
 
 	ln := h.getProxyListener()
 	port := ln.Addr().(*net.TCPAddr).Port
