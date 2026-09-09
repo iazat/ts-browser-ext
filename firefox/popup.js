@@ -14,13 +14,38 @@ document.addEventListener("DOMContentLoaded", () => {
   const exitNodeRow = document.getElementById("exitNodeRow");
   const exitNodeSelect = document.getElementById("exitNodeSelect");
 
+  // renderedExitNodes is a signature of what the picker currently shows, and
+  // pendingExitNodes a status whose rendering was put off. The picker's
+  // options must not be replaced while the user is in it: a status arrives
+  // every few seconds, and rebuilding the list under an open menu makes the
+  // browser commit whatever ends up at the clicked position when it closes.
+  // That was None — a change event with an empty value, sent to the backend
+  // as "stop using an exit node" by a user who had touched nothing.
+  let renderedExitNodes = "";
+  let pendingExitNodes = null;
+
   function renderExitNodes(status) {
     const nodes = status.exitNodes || [];
     if (!status.running || nodes.length === 0) {
       exitNodeRow.hidden = true;
+      renderedExitNodes = "";
       return;
     }
     exitNodeRow.hidden = false;
+    const selected = status.exitNode || "";
+    const signature = JSON.stringify([
+      !!status.exitNodeResolving,
+      selected,
+      nodes.map((n) => [n.name, !!n.online]),
+    ]);
+    if (signature === renderedExitNodes) {
+      return; // nothing changed; leave the element alone
+    }
+    if (document.activeElement === exitNodeSelect) {
+      pendingExitNodes = status;
+      return;
+    }
+    renderedExitNodes = signature;
     // None is a claim that no exit node is configured. Just after switching
     // on, the backend can have a selection it cannot name yet — the netmap is
     // still arriving. Saying None there is simply false, and it is the moment
@@ -31,7 +56,6 @@ document.addEventListener("DOMContentLoaded", () => {
       return;
     }
     exitNodeSelect.disabled = false;
-    const selected = status.exitNode || "";
     let html = `<option value=""${selected ? "" : " selected"}>None</option>`;
     for (const n of nodes) {
       const machineName = n.name.split(".")[0]; // FQDN -> admin-panel machine name
@@ -41,6 +65,14 @@ document.addEventListener("DOMContentLoaded", () => {
     }
     exitNodeSelect.innerHTML = html;
   }
+
+  exitNodeSelect.addEventListener("blur", () => {
+    if (pendingExitNodes) {
+      const status = pendingExitNodes;
+      pendingExitNodes = null;
+      renderExitNodes(status);
+    }
+  });
 
   exitNodeSelect.addEventListener("change", () => {
     browser.runtime.sendMessage({

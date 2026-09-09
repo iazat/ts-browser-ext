@@ -178,6 +178,42 @@ for (const target of TARGETS) {
       await page.close();
     });
 
+    // A status arrives every few seconds. Rebuilding the picker's options
+    // under an open menu made the browser commit whatever ended up at the
+    // clicked position when the menu closed — None — and that went to the
+    // backend as "stop using an exit node" from a user who touched nothing.
+    test("leaves the picker alone while the user is in it", async () => {
+      const { page } = await open(target, CONNECTED);
+      await page.focus("#exitNodeSelect");
+      const before = await page.$eval("#exitNodeSelect", (e) => e.value);
+
+      await page.evaluate((m) => window.__push(m), {
+        status: { ...CONNECTED.status, exitNode: "fra.tail1234.ts.net" },
+      });
+      assert.equal(
+        await page.$eval("#exitNodeSelect", (e) => e.value),
+        before,
+        "the picker was rebuilt under the user's hands"
+      );
+
+      // Once they leave it, the deferred status is rendered.
+      await page.evaluate(() => document.getElementById("exitNodeSelect").blur());
+      assert.equal(await page.$eval("#exitNodeSelect", (e) => e.value), "fra.tail1234.ts.net");
+      await page.close();
+    });
+
+    test("does not rebuild the picker when nothing changed", async () => {
+      const { page } = await open(target, CONNECTED);
+      await page.$eval("#exitNodeSelect", (e) => (e.options[0].marker = "kept"));
+      await page.evaluate((m) => window.__push(m), CONNECTED);
+      assert.equal(
+        await page.$eval("#exitNodeSelect", (e) => e.options[0].marker),
+        "kept",
+        "an identical status replaced the picker's options"
+      );
+      await page.close();
+    });
+
     test("re-enables the picker once the exit node is known", async () => {
       const { page } = await open(target, CONNECTED);
       assert.equal(await page.$eval("#exitNodeSelect", (e) => e.disabled), false);

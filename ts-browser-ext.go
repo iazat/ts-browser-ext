@@ -1692,14 +1692,7 @@ async function load() {
     row("Tailscale IP", esc(d.selfIP)) +
     row("Backend", esc(d.version));
 
-  const sel = document.getElementById("exitNode");
-  let opts = '<option value=""' + (d.exitNode ? "" : " selected") + ">None</option>";
-  for (const p of d.peers) {
-    if (!p.exitNodeOption) continue;
-    const label = esc(p.name) + (p.online ? "" : " (offline)");
-    opts += '<option value="' + esc(p.name) + '"' + (p.name === d.exitNode ? " selected" : "") + ">" + label + "</option>";
-  }
-  sel.innerHTML = opts;
+  renderExitNodePicker(d);
 
   const rows = d.peers.map(function(p) {
     return '<tr><td class="name">' + '<span class="dot ' + (p.online ? "on" : "off") + '"></span>' + esc(p.name) +
@@ -1711,6 +1704,31 @@ async function load() {
 }
 
 function row(k, v) { return '<div class="row"><span class="k">' + k + '</span><span class="v">' + v + "</span></div>"; }
+
+// The picker is rebuilt only when its contents change, and never while the
+// user is in it. This page refreshes every few seconds, and replacing the
+// options under an open menu makes the browser commit whatever sits at the
+// clicked position when the menu closes — None, in practice, sent to the
+// backend as a request to stop using the exit node.
+var renderedPicker = "";
+var pendingPicker = null;
+function renderExitNodePicker(d) {
+  const sel = document.getElementById("exitNode");
+  const nodes = d.peers.filter(function(p) { return p.exitNodeOption; });
+  const signature = JSON.stringify([d.exitNode, nodes.map(function(p) { return [p.name, p.online]; })]);
+  if (signature === renderedPicker) return;
+  if (document.activeElement === sel) { pendingPicker = d; return; }
+  renderedPicker = signature;
+  let opts = '<option value=""' + (d.exitNode ? "" : " selected") + ">None</option>";
+  for (const p of nodes) {
+    const label = esc(p.name) + (p.online ? "" : " (offline)");
+    opts += '<option value="' + esc(p.name) + '"' + (p.name === d.exitNode ? " selected" : "") + ">" + label + "</option>";
+  }
+  sel.innerHTML = opts;
+}
+document.getElementById("exitNode").addEventListener("blur", function() {
+  if (pendingPicker) { const d = pendingPicker; pendingPicker = null; renderExitNodePicker(d); }
+});
 
 function statusLabel(state) {
   if (state === "Running") return '<span class="dot on"></span>Connected';
