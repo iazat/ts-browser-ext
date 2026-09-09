@@ -238,6 +238,48 @@ for (const target of TARGETS) {
       await page.close();
     });
 
+    // The background reports a host that answered and then went away as
+    // reconnecting. That is not a missing install and not an error: the
+    // popup waits, with the toggle disabled, since there is nothing to toggle.
+    test("says it is reconnecting, without an install command", async () => {
+      const { page } = await open(target, { reconnecting: true, error: "Native host has exited." });
+      const text = (await page.textContent("#state")).trim();
+      assert.ok(text.includes("Reconnecting"), `got ${JSON.stringify(text)}`);
+      assert.ok(!text.includes("--install"), "asked for an install while reconnecting");
+      assert.equal(await page.$eval("#toggleSlider", (e) => e.disabled), true);
+      assert.equal(await page.isVisible("#settingsButton"), false);
+      await page.close();
+    });
+
+    test("re-enables the toggle once the backend is back", async () => {
+      const { page } = await open(target, { reconnecting: true });
+      await page.evaluate((m) => window.__push(m), CONNECTED);
+      assert.equal(await page.$eval("#toggleSlider", (e) => e.disabled), false);
+      assert.equal(await page.isVisible("#settingsButton"), true);
+      await page.close();
+    });
+
+    // "Native host has exited" and "not found" both leave the popup asking
+    // for an install, and the fix is different for each, so the browser's
+    // reason is shown under the command rather than lost to the console.
+    test("shows the browser's reason under the install command", async () => {
+      const { page } = await open(target, {
+        installCmd: "go run github.com/iazat/ts-browser-ext@latest --install=Fabc",
+        error: "Native host has exited.",
+      });
+      const text = await page.textContent("#state");
+      assert.ok(text.includes("--install=F"));
+      assert.ok(text.includes("Native host has exited."), `reason missing from ${JSON.stringify(text)}`);
+      await page.close();
+    });
+
+    test("the install command is shown as text, not markup", async () => {
+      const { page } = await open(target, { installCmd: "<img src=x onerror=alert(1)>" });
+      const imgs = await page.$$("#state img");
+      assert.equal(imgs.length, 0, "the install command was inserted as HTML");
+      await page.close();
+    });
+
     test("the toggle reflects connection state", async () => {
       const on = await open(target, CONNECTED);
       const onClass = await on.page.getAttribute(".slider", "class");

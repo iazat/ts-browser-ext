@@ -142,11 +142,40 @@ document.addEventListener("DOMContentLoaded", () => {
     console.log("Received from background:", JSON.stringify(msg));
     if (msg.installCmd) {
       console.log("Received install command");
-      stateDisplay.innerHTML = `<b>Installation needed. Run:</b><pre>${msg.installCmd}</pre>`;
+      stateDisplay.textContent = "";
+      const heading = document.createElement("b");
+      heading.textContent = "Installation needed. Run:";
+      const pre = document.createElement("pre");
+      pre.textContent = msg.installCmd;
+      stateDisplay.append(heading, pre);
+      if (msg.error) {
+        // The browser's reason for not having a backend, e.g. "Native host
+        // has exited": a host that crashes on start looks the same as one
+        // that was never installed, and the fix is different.
+        const why = document.createElement("div");
+        why.className = "detail";
+        why.textContent = msg.error;
+        stateDisplay.append(why);
+      }
       toggleSlider.disabled = true;
       settingsButton.hidden = true;
       return;
     }
+    // The backend went away and the background is bringing up a fresh one.
+    // It is not missing, so no install command; and the toggle is left
+    // disabled until there is something on the other end of it.
+    if (msg.reconnecting) {
+      console.log("Backend restarting");
+      stateDisplay.textContent = "Reconnecting to the backend…";
+      isLoading = true;
+      updateSliderState();
+      toggleSlider.disabled = true;
+      settingsButton.hidden = true;
+      exitNodeRow.hidden = true;
+      return;
+    }
+    toggleSlider.disabled = false;
+    settingsButton.hidden = false;
     if (msg.error) {
       console.log("Error from background:", msg);
       stateDisplay.textContent = msg.error;

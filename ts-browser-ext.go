@@ -25,13 +25,13 @@ import (
 	"time"
 
 	"tailscale.com/client/local"
-	"tailscale.com/client/tailscale"
 	"tailscale.com/hostinfo"
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/net/proxymux"
 	"tailscale.com/net/socks5"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tsd"
 	"tailscale.com/tsnet"
 	"tailscale.com/types/logger"
 	"tailscale.com/types/netmap"
@@ -121,6 +121,8 @@ extension's own ID:
 	port := ln.Addr().(*net.TCPAddr).Port
 	h.logf("Proxy listening on localhost:%v", port)
 
+	go h.statusLoop()
+
 	h.send(&reply{ProcRunning: &procRunningResult{
 		Port: port,
 		Pid:  os.Getpid(),
@@ -128,6 +130,40 @@ extension's own ID:
 	h.logf("Starting readMessages loop")
 	err := h.readMessages()
 	h.logf("readMessage loop ended: %v", err)
+	h.shutdown()
+}
+
+// shutdownTimeout bounds how long exiting waits for tsnet to close. The
+// browser has already closed our stdin by the time this runs, and a
+// replacement process may be about to open the same state directory, so
+// hanging around is worse than leaving a little state unflushed.
+const shutdownTimeout = 5 * time.Second
+
+// shutdown stops the IPN bus watcher and closes tsnet, so the process leaves
+// the state directory and its WireGuard socket cleanly rather than by dying.
+func (h *host) shutdown() {
+	h.mu.Lock()
+	cancel := h.cancelCtx
+	started := h.initDone
+	h.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if !started {
+		return
+	}
+	closed := make(chan struct{})
+	go func() {
+		if err := h.ts.Close(); err != nil {
+			h.logf("tsnet.Close: %v", err)
+		}
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(shutdownTimeout):
+		h.logf("tsnet.Close did not return within %v; exiting anyway", shutdownTimeout)
+	}
 }
 
 func getTargetDir(browserByte string) (string, error) {
@@ -268,7 +304,16 @@ type host struct {
 
 	lenBuf [4]byte // owned by readMessages
 
-	mu              sync.Mutex
+	// statusCh carries coalesced requests for a status message; see
+	// scheduleStatus and statusLoop.
+	statusCh chan struct{}
+
+	mu sync.Mutex
+	// initInFlight is set while handleInit is starting tsnet, which happens
+	// off the reader goroutine; initDone is set once it has succeeded. Until
+	// then h.ts must not be asked for a LocalClient: see localClient.
+	initInFlight    bool
+	initDone        bool
 	watchDead       bool
 	lastNetmap      *netmap.NetworkMap
 	lastState       ipn.State
@@ -291,6 +336,7 @@ func newHost(r io.Reader, w io.Writer) *host {
 		br:          bufio.NewReaderSize(r, 1<<20),
 		w:           w,
 		logf:        log.Printf,
+		statusCh:    make(chan struct{}, 1),
 		exitNodeSet: true, // assume the strict case until Prefs says otherwise
 	}
 	h.ts = &tsnet.Server{
@@ -306,6 +352,20 @@ func newHost(r io.Reader, w io.Writer) *host {
 
 const maxMsgSize = 1 << 20
 
+// errNotInit is returned by commands that need tsnet before init has
+// started it.
+var errNotInit = errors.New("not init")
+
+// readMessages runs the native messaging loop until stdin is closed or
+// unreadable, which is how the browser ends this process.
+//
+// A command that fails is reported and then forgotten. It used to end the
+// loop, and with it the process: an "up" that arrived before init, or an
+// EditPrefs that took more than its deadline because the backend was busy
+// with a netmap, took the whole proxy down. The browser was still pointed at
+// it, so every page failed until the extension noticed the disconnect and
+// brought up a replacement — seconds of dead browsing for a single slow
+// call.
 func (h *host) readMessages() error {
 	for {
 		msg, err := h.readMessage()
@@ -314,7 +374,7 @@ func (h *host) readMessages() error {
 		}
 		if err := h.handleMessage(msg); err != nil {
 			h.logf("error handling message %v: %v", msg, err)
-			return err
+			h.send(&reply{CmdError: &cmdErrorResult{Cmd: msg.Cmd, Error: err.Error()}})
 		}
 	}
 }
@@ -331,10 +391,32 @@ func (h *host) handleMessage(msg *request) error {
 		return h.handleDown()
 	case CmdSetExitNode:
 		return h.handleSetExitNode(msg)
+	case CmdPing:
+		h.send(&reply{Pong: true})
 	default:
 		h.logf("unknown command %q", msg.Cmd)
 	}
 	return nil
+}
+
+// localClient returns the LocalAPI client once init has started tsnet.
+//
+// Every caller must go through here rather than h.ts.LocalClient(). That
+// method starts tsnet if it is not running, and before init the hostname and
+// state directory have not been set, so it would bring up a stranger of a
+// node under a default directory — after which init itself fails with
+// "already running" and the profile the user logged in as never comes up.
+// The management page refreshes itself every few seconds, and a tab left on
+// it is restored at browser start, so its first request could land in
+// exactly that window.
+func (h *host) localClient() (*local.Client, error) {
+	h.mu.Lock()
+	ok := h.initDone
+	h.mu.Unlock()
+	if !ok {
+		return nil, errNotInit
+	}
+	return h.ts.LocalClient()
 }
 
 func (h *host) handleUp() error {
@@ -345,21 +427,28 @@ func (h *host) handleDown() error {
 	return h.setWantRunning(false)
 }
 
+// localAPITimeout bounds the LocalAPI calls made on behalf of a command. The
+// backend answers in milliseconds normally; the deadline is for the moments
+// it is busy applying a netmap, and a call that outlives it is reported to
+// the extension rather than treated as fatal.
+const localAPITimeout = 10 * time.Second
+
+// setWantRunning is called on the reader goroutine and must not hold h.mu
+// across the LocalAPI call: userDial takes that lock for every browser
+// connection, and holding it for up to localAPITimeout stalled the whole
+// browser behind one slow EditPrefs.
 func (h *host) setWantRunning(want bool) error {
 	defer h.sendStatus()
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.ts.Sys() == nil {
-		return fmt.Errorf("not init")
-	}
-	h.wantUp = want
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	lc, err := h.ts.LocalClient()
+	lc, err := h.localClient()
 	if err != nil {
 		return err
 	}
+	h.mu.Lock()
+	h.wantUp = want
+	h.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), localAPITimeout)
+	defer cancel()
+
 	if _, err := lc.EditPrefs(ctx, &ipn.MaskedPrefs{
 		WantRunningSet: true,
 		Prefs: ipn.Prefs{
@@ -376,16 +465,11 @@ func (h *host) setWantRunning(want bool) error {
 // the current status the same way `tailscale set --exit-node` does.
 func (h *host) handleSetExitNode(msg *request) error {
 	defer h.sendStatus()
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.ts.Sys() == nil {
-		return fmt.Errorf("not init")
-	}
-	lc, err := h.ts.LocalClient()
+	lc, err := h.localClient()
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), localAPITimeout)
 	defer cancel()
 	return applyExitNode(ctx, lc, msg.ExitNode)
 }
@@ -510,25 +594,10 @@ func machineName(dnsName, hostName string) string {
 	return name
 }
 
-func (h *host) handleInit(msg *request) (ret error) {
-	defer func() {
-		var errMsg string
-		if ret != nil {
-			errMsg = ret.Error()
-		}
-		h.send(&reply{
-			Init: &initResult{Error: errMsg},
-		})
-	}()
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	if h.cancelCtx != nil {
-		h.cancelCtx()
-	}
-	h.ctx, h.cancelCtx = context.WithCancel(context.Background())
-
-	id := msg.InitID
+// validInitID checks the profile id the extension sends. It comes from
+// JavaScript and names a directory under the user's config dir, so it must be
+// UUID-ish — hex and hyphens only — and not too long.
+func validInitID(id string) error {
 	if len(id) == 0 {
 		return fmt.Errorf("missing initID")
 	}
@@ -542,10 +611,72 @@ func (h *host) handleInit(msg *request) (ret error) {
 		}
 		return errors.New("invalid initID character")
 	}
+	return nil
+}
 
-	if h.ts.Sys() != nil {
-		return fmt.Errorf("already running")
+// handleInit validates the request and starts tsnet on its own goroutine,
+// answering with an init reply when that is done.
+//
+// Starting is the one thing this process does that can take seconds, and it
+// used to run on the reader goroutine with h.mu held. While it ran, nothing
+// else was read from the browser and every proxy connection sat behind the
+// lock; and had it hung — a state directory the previous process was still
+// closing, say — the loop would never have noticed stdin closing, and the
+// process would have outlived the browser that started it.
+func (h *host) handleInit(msg *request) error {
+	if err := validInitID(msg.InitID); err != nil {
+		h.send(&reply{Init: &initResult{Error: err.Error()}})
+		return err
 	}
+
+	h.mu.Lock()
+	if h.initDone || h.initInFlight {
+		h.mu.Unlock()
+		err := fmt.Errorf("already running")
+		h.send(&reply{Init: &initResult{Error: err.Error()}})
+		return err
+	}
+	h.initInFlight = true
+	if h.cancelCtx != nil {
+		h.cancelCtx()
+	}
+	h.ctx, h.cancelCtx = context.WithCancel(context.Background())
+	ctx := h.ctx
+	h.mu.Unlock()
+
+	go h.startTailscale(ctx, msg.InitID)
+	return nil
+}
+
+// startTailscale brings up tsnet for the profile and reports the outcome to
+// the extension.
+//
+// A failure here is fatal to the process, deliberately. tsnet starts once per
+// process, so a failed start cannot be retried in place; exiting lets the
+// extension notice the disconnect and bring up a fresh process, which is the
+// retry. The reply goes out first so the popup can say why.
+func (h *host) startTailscale(ctx context.Context, id string) {
+	err := h.startTailscaleErr(ctx, id)
+
+	h.mu.Lock()
+	h.initInFlight = false
+	h.initDone = err == nil
+	h.mu.Unlock()
+
+	var errMsg string
+	if err != nil {
+		errMsg = err.Error()
+	}
+	h.send(&reply{Init: &initResult{Error: errMsg}})
+
+	if err != nil {
+		h.logf("init failed: %v; exiting so the extension can start a fresh process", err)
+		os.Exit(1)
+	}
+	h.scheduleStatus()
+}
+
+func (h *host) startTailscaleErr(ctx context.Context, id string) error {
 	u, err := user.Current()
 	if err != nil {
 		return fmt.Errorf("getting current user: %w", err)
@@ -568,44 +699,84 @@ func (h *host) handleInit(msg *request) (ret error) {
 	if err != nil {
 		return fmt.Errorf("getting local client: %w", err)
 	}
-
-	// NotifyInitialNetMap matters: without it the first netmap only arrives
-	// when something about the tailnet happens to change, so a backend that
-	// comes up already logged in reports an empty tailnet name until then.
-	// It is not one of NotifyRateLimitIncompatibleBits, so it combines.
-	wc, err := lc.WatchIPNBus(h.ctx, ipn.NotifyInitialState|ipn.NotifyInitialNetMap|ipn.NotifyInitialPrefs|ipn.NotifyRateLimit)
-	if err != nil {
-		return fmt.Errorf("watching IPN bus: %w", err)
-	}
-	go h.watchIPNBus(wc)
-
+	go h.watchIPNBus(ctx, lc)
 	return nil
 }
 
-func (h *host) watchIPNBus(wc *tailscale.IPNBusWatcher) {
-	h.mu.Lock()
-	h.watchDead = false
-	h.mu.Unlock()
+// ipnWatchMask is what the backend is asked to report.
+//
+// NotifyInitialNetMap matters: without it the first netmap only arrives when
+// something about the tailnet happens to change, so a backend that comes up
+// already logged in reports an empty tailnet name until then. It is not one
+// of NotifyRateLimitIncompatibleBits, so it combines.
+const ipnWatchMask = ipn.NotifyInitialState | ipn.NotifyInitialNetMap | ipn.NotifyInitialPrefs | ipn.NotifyRateLimit
 
-	for h.updateFromWatcher(wc) {
-		// Keep going.
+// watchIPNBus keeps a subscription to the backend's notifications open for
+// as long as ctx lives, resubscribing whenever one ends.
+//
+// A subscription can end without the backend going anywhere. Tailscale
+// closes a watcher that falls behind — 128 undelivered notifications — and
+// this one used to handle each notification by making two LocalAPI calls
+// and writing to the browser before reading the next, which on a busy tailnet
+// is slow enough to fall behind. When it happened, the status carried
+// "WatchIPNBus stopped" for the rest of the process's life: the toggle
+// looked broken and the exit node picker vanished, with the tailnet in fact
+// fine. Resubscribing gets the initial state, netmap and prefs again, so
+// nothing is lost but the gap.
+func (h *host) watchIPNBus(ctx context.Context, lc *local.Client) {
+	delay := time.Second
+	for ctx.Err() == nil {
+		wc, err := lc.WatchIPNBus(ctx, ipnWatchMask)
+		if err != nil {
+			h.logf("watchIPNBus: subscribing: %v", err)
+		} else {
+			h.setWatchDead(false)
+			delay = time.Second
+			for h.updateFromWatcher(wc) {
+				// Keep going.
+			}
+			wc.Close()
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		h.setWatchDead(true)
+		h.scheduleStatus()
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		delay = min(delay*2, 15*time.Second)
 	}
 }
 
-func (h *host) updateFromWatcher(wc *tailscale.IPNBusWatcher) bool {
-	n, err := wc.Next()
-
-	defer h.sendStatus()
-
+func (h *host) setWatchDead(dead bool) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.watchDead = dead
+	h.mu.Unlock()
+}
 
+// updateFromWatcher applies one notification and reports whether the
+// subscription is still good.
+//
+// It only records what it was told and hands the status off to statusLoop.
+// Doing the LocalAPI calls here, one notification at a time, is what let the
+// watcher fall behind; see watchIPNBus.
+func (h *host) updateFromWatcher(wc *local.IPNBusWatcher) bool {
+	n, err := wc.Next()
 	if err != nil {
-		log.Printf("watchIPNBus: %v", err)
-		h.watchDead = true
+		h.logf("watchIPNBus: %v", err)
 		return false
 	}
+	if n.ErrMessage != nil {
+		// The backend's way of saying the subscription is being closed on
+		// it, e.g. "IPN bus consumer fell behind". The stream ends after
+		// this and the next Next reports it.
+		h.logf("watchIPNBus: backend: %s", *n.ErrMessage)
+	}
 
+	h.mu.Lock()
 	if n.NetMap != nil {
 		h.lastNetmap = n.NetMap
 	}
@@ -623,9 +794,41 @@ func (h *host) updateFromWatcher(wc *tailscale.IPNBusWatcher) bool {
 		// TODO: pop a browser for Tailscale SSH check mode etc, even
 		// if already logged in.
 	}
+	h.mu.Unlock()
+
+	h.scheduleStatus()
 	return true
 }
 
+// scheduleStatus asks for a status message to be sent soon. Requests made
+// while one is pending fold into it: a burst of notifications produces one
+// status built after the last of them, not one per notification.
+func (h *host) scheduleStatus() {
+	select {
+	case h.statusCh <- struct{}{}:
+	default:
+	}
+}
+
+// statusLoop sends the status messages scheduleStatus asks for, one at a
+// time, on a goroutine of its own so that the LocalAPI calls behind each one
+// hold up neither the IPN bus watcher nor the command reader.
+func (h *host) statusLoop() {
+	for range h.statusCh {
+		h.sendStatus()
+	}
+}
+
+// send writes one native messaging frame: a little-endian length, then the
+// JSON. It is called from several goroutines — the reader answering a
+// command, statusLoop, the management page's handlers — so the frame is
+// assembled in a buffer of its own and written with one call under the lock.
+//
+// It used to stage the length in a field shared with the reader and write it
+// with a second call. Two sends at once could then put one message's length
+// in front of the other's body, and the browser, reading a frame that did
+// not match, either dropped the connection or waited for bytes that were
+// never coming: a popup stuck on its last state, a toggle that did nothing.
 func (h *host) send(msg *reply) error {
 	msgb, err := json.Marshal(msg)
 	if err != nil {
@@ -635,16 +838,13 @@ func (h *host) send(msg *reply) error {
 	if len(msgb) > maxMsgSize {
 		return fmt.Errorf("message too big (%v)", len(msgb))
 	}
-	binary.LittleEndian.PutUint32(h.lenBuf[:], uint32(len(msgb)))
+	frame := make([]byte, 4+len(msgb))
+	binary.LittleEndian.PutUint32(frame, uint32(len(msgb)))
+	copy(frame[4:], msgb)
 	h.wmu.Lock()
 	defer h.wmu.Unlock()
-	if _, err := h.w.Write(h.lenBuf[:]); err != nil {
-		return err
-	}
-	if _, err := h.w.Write(msgb); err != nil {
-		return err
-	}
-	return nil
+	_, err = h.w.Write(frame)
+	return err
 }
 
 func (h *host) getProxyListener() net.Listener {
@@ -705,23 +905,65 @@ func safeToDial(state ipn.State, exitNodeSet bool) bool {
 	return state == ipn.Running || state == ipn.NeedsLogin
 }
 
-func (h *host) userDial(ctx context.Context, netw, addr string) (net.Conn, error) {
+// dialReadyTimeout is how long a browser connection waits for the backend to
+// become safe to dial through before it is failed.
+//
+// The extension points the browser at this proxy the moment the port is
+// known, which is before init has even been received, and a page loaded in
+// the next seconds used to fail outright: "no tsnet.Server", then "not
+// routing yet". Chrome shows those as a broken proxy, and the user's reading
+// of a browser that fails every page for a while after starting is that the
+// extension is hung. Waiting turns that into a page that takes a moment
+// longer to load. The wait is bounded so that a backend that never gets
+// there — no network, a login that expired — still fails loudly.
+const dialReadyTimeout = 20 * time.Second
+
+// dialable reports whether browser traffic may be sent through tsnet right
+// now, returning the system to dial through when it may.
+func (h *host) dialable() (sys *tsd.System, state ipn.State, ok bool) {
 	h.mu.Lock()
-	sys := h.ts.Sys()
-	state := h.lastState
-	exitNodeSet := h.exitNodeSet
-	h.mu.Unlock()
-
-	if sys == nil {
-		h.logf("userDial to %v/%v without a tsnet.Server started", netw, addr)
-		return nil, fmt.Errorf("no tsnet.Server")
+	defer h.mu.Unlock()
+	if !h.initDone {
+		return nil, h.lastState, false
 	}
+	sys = h.ts.Sys()
+	return sys, h.lastState, sys != nil && safeToDial(h.lastState, h.exitNodeSet)
+}
 
-	if !safeToDial(state, exitNodeSet) {
-		h.logf("userDial to %v/%v refused: exit node configured, backend in state %v", netw, addr, state)
-		return nil, fmt.Errorf("not routing yet: an exit node is configured but the tailnet is %v", state)
+// waitDialable blocks until the backend is safe to dial through, ctx ends,
+// or dialReadyTimeout passes.
+func (h *host) waitDialable(ctx context.Context, netw, addr string) (*tsd.System, error) {
+	sys, state, ok := h.dialable()
+	if ok {
+		return sys, nil
 	}
+	h.logf("userDial to %v/%v: waiting, backend in state %v", netw, addr, state)
 
+	deadline := time.NewTimer(dialReadyTimeout)
+	defer deadline.Stop()
+	tick := time.NewTicker(100 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-deadline.C:
+			_, state, _ = h.dialable()
+			h.logf("userDial to %v/%v refused: backend still in state %v after %v", netw, addr, state, dialReadyTimeout)
+			return nil, fmt.Errorf("not routing yet: the tailnet is %v", state)
+		case <-tick.C:
+			if sys, _, ok := h.dialable(); ok {
+				return sys, nil
+			}
+		}
+	}
+}
+
+func (h *host) userDial(ctx context.Context, netw, addr string) (net.Conn, error) {
+	sys, err := h.waitDialable(ctx, netw, addr)
+	if err != nil {
+		return nil, err
+	}
 	return sys.Dialer.Get().UserDial(ctx, netw, addr)
 }
 
@@ -741,45 +983,42 @@ func (h *host) sendStatus() {
 	if h.watchDead {
 		st.Error = "WatchIPNBus stopped"
 	}
-	hasServer := h.ts.Sys() != nil
 	h.mu.Unlock()
 
 	// Populate the exit node list outside the lock (it does IPC).
-	if hasServer {
-		if lc, err := h.ts.LocalClient(); err == nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			if full, err := lc.Status(ctx); err == nil {
-				// The management page reads the tailnet from here and got it
-				// right while the popup showed nothing, so trust this when
-				// the netmap has not given us a name.
-				if st.Tailnet == "" && full.CurrentTailnet != nil {
-					st.Tailnet = full.CurrentTailnet.Name
-				}
-				prefID, prefIP, prefsOK := configuredExitNode(lc, h.logf)
-				for _, ps := range full.Peer {
-					if !ps.ExitNodeOption {
-						continue
-					}
-					name := strings.TrimSuffix(ps.DNSName, ".")
-					if name == "" {
-						name = ps.HostName
-					}
-					selected := isConfiguredExitNode(ps, prefID, prefIP)
-					st.ExitNodes = append(st.ExitNodes, exitNodeInfo{
-						Name:     name,
-						Online:   ps.Online,
-						Selected: selected,
-					})
-					if selected {
-						st.ExitNode = name
-					}
-				}
-				sort.Slice(st.ExitNodes, func(i, j int) bool {
-					return st.ExitNodes[i].Name < st.ExitNodes[j].Name
-				})
-				st.ExitNodeResolving = exitNodeResolving(prefsOK, prefID, prefIP, st.ExitNode != "")
+	if lc, err := h.localClient(); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), localAPITimeout)
+		defer cancel()
+		if full, err := lc.Status(ctx); err == nil {
+			// The management page reads the tailnet from here and got it
+			// right while the popup showed nothing, so trust this when
+			// the netmap has not given us a name.
+			if st.Tailnet == "" && full.CurrentTailnet != nil {
+				st.Tailnet = full.CurrentTailnet.Name
 			}
-			cancel()
+			prefID, prefIP, prefsOK := configuredExitNode(lc, h.logf)
+			for _, ps := range full.Peer {
+				if !ps.ExitNodeOption {
+					continue
+				}
+				name := strings.TrimSuffix(ps.DNSName, ".")
+				if name == "" {
+					name = ps.HostName
+				}
+				selected := isConfiguredExitNode(ps, prefID, prefIP)
+				st.ExitNodes = append(st.ExitNodes, exitNodeInfo{
+					Name:     name,
+					Online:   ps.Online,
+					Selected: selected,
+				})
+				if selected {
+					st.ExitNode = name
+				}
+			}
+			sort.Slice(st.ExitNodes, func(i, j int) bool {
+				return st.ExitNodes[i].Name < st.ExitNodes[j].Name
+			})
+			st.ExitNodeResolving = exitNodeResolving(prefsOK, prefID, prefIP, st.ExitNode != "")
 		}
 	}
 
@@ -796,6 +1035,9 @@ const (
 	CmdDown        Cmd = "down"
 	CmdGetStatus   Cmd = "get-status"
 	CmdSetExitNode Cmd = "set-exit-node"
+	// CmdPing is answered with a Pong and nothing else. The extension uses
+	// it to tell a live backend from one that has stopped answering.
+	CmdPing Cmd = "ping"
 )
 
 // request is a message from the browser extension.
@@ -829,6 +1071,18 @@ type reply struct {
 	Status *status `json:"status,omitempty"`
 
 	Init *initResult `json:"init,omitempty"`
+
+	// CmdError reports a command that failed. The process carries on; the
+	// extension decides what, if anything, to show.
+	CmdError *cmdErrorResult `json:"cmdError,omitempty"`
+
+	// Pong answers a [CmdPing].
+	Pong bool `json:"pong,omitempty"`
+}
+
+type cmdErrorResult struct {
+	Cmd   Cmd    `json:"cmd"`
+	Error string `json:"error"`
 }
 
 type procRunningResult struct {
@@ -929,10 +1183,25 @@ func firstIP(ips []netip.Addr) string {
 	return ips[0].String()
 }
 
-func (h *host) serveInternalData(w http.ResponseWriter, r *http.Request) {
-	lc, err := h.ts.LocalClient()
+// internalLocalClient is localClient for the management page's handlers: a
+// backend that init has not started yet is a 503, so the page's next refresh
+// tries again, rather than a start of the wrong node.
+func (h *host) internalLocalClient(w http.ResponseWriter) (*local.Client, bool) {
+	lc, err := h.localClient()
+	if errors.Is(err, errNotInit) {
+		http.Error(w, "the backend is still starting; try again in a moment", http.StatusServiceUnavailable)
+		return nil, false
+	}
 	if err != nil {
 		http.Error(w, err.Error(), 500)
+		return nil, false
+	}
+	return lc, true
+}
+
+func (h *host) serveInternalData(w http.ResponseWriter, r *http.Request) {
+	lc, ok := h.internalLocalClient(w)
+	if !ok {
 		return
 	}
 	st, err := lc.Status(r.Context())
@@ -978,9 +1247,8 @@ func (h *host) serveInternalSetExitNode(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	lc, err := h.ts.LocalClient()
-	if err != nil {
-		http.Error(w, err.Error(), 500)
+	lc, ok := h.internalLocalClient(w)
+	if !ok {
 		return
 	}
 	if err := applyExitNode(r.Context(), lc, body.ExitNode); err != nil {
@@ -992,9 +1260,8 @@ func (h *host) serveInternalSetExitNode(w http.ResponseWriter, r *http.Request) 
 }
 
 func (h *host) serveInternalLogout(w http.ResponseWriter, r *http.Request) {
-	lc, err := h.ts.LocalClient()
-	if err != nil {
-		http.Error(w, err.Error(), 500)
+	lc, ok := h.internalLocalClient(w)
+	if !ok {
 		return
 	}
 	if err := lc.Logout(r.Context()); err != nil {
@@ -1011,7 +1278,7 @@ func (h *host) httpProxyHandler() http.Handler {
 	rp := &httputil.ReverseProxy{
 		Director: func(r *http.Request) {}, // no change
 		Transport: &http.Transport{
-			DialContext: h.userDial,
+			DialContext: h.dialWithTimeout,
 		},
 	}
 
@@ -1034,7 +1301,7 @@ func (h *host) httpProxyHandler() http.Handler {
 		// CONNECT support:
 
 		dst := r.RequestURI
-		c, err := h.userDial(r.Context(), "tcp", dst)
+		c, err := h.dialWithTimeout(r.Context(), "tcp", dst)
 		if err != nil {
 			w.Header().Set("Tailscale-Connect-Error", err.Error())
 			http.Error(w, err.Error(), 500)
@@ -1072,6 +1339,26 @@ func (h *host) httpProxyHandler() http.Handler {
 		}()
 		<-errc
 	})
+}
+
+// proxyDialTimeout bounds a dial made for a browser connection, the wait in
+// waitDialable included.
+//
+// A dial through the userspace stack to an exit node that has gone quiet has
+// no deadline of its own that the browser would recognise: the SYN is
+// retried for a long time and CONNECT just sits there, which the user sees
+// as a tab that never loads and a browser that has hung. The SOCKS path
+// already carries a deadline of its own inside Tailscale's server; this puts
+// one on the HTTP path too.
+const proxyDialTimeout = 30 * time.Second
+
+// dialWithTimeout is userDial under proxyDialTimeout. The context only
+// governs the dial: the connections tsnet hands back are not tied to it, so
+// cancelling it once the dial has returned does not close them.
+func (h *host) dialWithTimeout(ctx context.Context, netw, addr string) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(ctx, proxyDialTimeout)
+	defer cancel()
+	return h.userDial(ctx, netw, addr)
 }
 
 // internalPageHTML is the management page served at http://100.100.100.100/.

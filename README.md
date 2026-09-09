@@ -33,6 +33,38 @@ can keep work and personal tailnets fully separate.
 
 Most of these predate the fork:
 
+- **The extension hung after its backend restarted.** Every native host is a
+  fresh process that has to be sent `init`, and the flag that stops `init`
+  being sent twice survived the host dying — so the replacement never started
+  tsnet, the popup read "Connecting…" for good, and every page failed until
+  the extension was reloaded. Firefox never even reconnected, because it read
+  the disconnect reason from Chrome's `runtime.lastError` instead of
+  `port.error`.
+- **One failed command killed the whole proxy.** The backend's message loop
+  exited on any handler error — an `up` that arrived before `init`, an
+  `EditPrefs` that missed its deadline while the backend was busy — taking the
+  proxy the browser was pointed at with it.
+- **Concurrent replies corrupted the native messaging stream.** The frame
+  length was staged in a field shared with the reader and written separately
+  from its body, so two replies at once could put one message's length in
+  front of the other's. The browser then either dropped the connection or
+  waited for bytes that never came: a popup stuck on its last state, a toggle
+  that did nothing.
+- **A lagging IPN bus watcher stopped the backend for good.** Tailscale closes
+  a watcher that falls 128 notifications behind, and this one did two LocalAPI
+  calls per notification on the watcher's own goroutine. Once closed, the
+  status read "WatchIPNBus stopped" until the browser was restarted. It
+  resubscribes now, and status messages are built off the watcher's goroutine
+  and coalesced.
+- **A tab left on the management page could start the wrong node.** Its
+  auto-refresh hit the backend before `init`, and `tsnet.Server.LocalClient`
+  starts the server if it is not running — with no hostname or state
+  directory set. `init` then failed with "already running".
+- **Pages loaded right after startup failed instead of waiting.** The browser
+  is pointed at the proxy before `init` is even received; dials now wait for
+  the backend (up to 20 s) rather than failing on the spot, and CONNECT dials
+  have a deadline (30 s) so an exit node that has gone quiet cannot leave a
+  tab spinning indefinitely.
 - **The connect toggle only worked once.** Turning the extension off left the
   browser on a direct connection, and turning it back on never restored the
   proxy — the only way back was reloading the extension.
@@ -179,8 +211,9 @@ npm test
 ```
 
 `tests/background.test.mjs` runs both background scripts against a mocked
-WebExtension API — proxy lifecycle, the commands the popup sends, and the
-messages that reach the native host. `tests/popup.test.mjs` renders both
+WebExtension API — proxy lifecycle, the commands the popup sends, the
+messages that reach the native host, and what happens when the host goes away
+(reconnect with backoff, a fresh `init` for its replacement). `tests/popup.test.mjs` renders both
 popups in Chromium and drives them through their states. The popup suite runs
 in Chromium even for the Firefox copy: the markup, CSS and `popup.js` logic
 are shared, so that is what it covers. Firefox's `proxy.onRequest` and
