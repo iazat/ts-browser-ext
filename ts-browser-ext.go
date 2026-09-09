@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -373,9 +374,12 @@ type host struct {
 	// initInFlight is set while handleInit is starting tsnet, which happens
 	// off the reader goroutine; initDone is set once it has succeeded. Until
 	// then h.ts must not be asked for a LocalClient: see localClient.
-	initInFlight    bool
-	initDone        bool
-	watchDead       bool
+	initInFlight bool
+	initDone     bool
+	watchDead    bool
+	// lastSentStatus is the status last written to the extension, encoded,
+	// so that emitStatus can avoid repeating itself.
+	lastSentStatus  []byte
 	lastNetmap      *netmap.NetworkMap
 	lastState       ipn.State
 	lastBrowseToURL string
@@ -517,6 +521,78 @@ func (h *host) setWantRunning(want bool) error {
 		},
 	}); err != nil {
 		return fmt.Errorf("EditPrefs to wantRunning=%v: %w", want, err)
+	}
+	if err := writeSavedWantRunning(h.savedWantRunningPath(), want); err != nil {
+		h.logf("remembering the switch: %v", err)
+	}
+	return nil
+}
+
+// savedWantRunningFile remembers the toggle between processes, for the same
+// reason the exit node is remembered: tsnet starts the backend with
+// WantRunning set, whatever it was left at. A profile switched off and then
+// restarted — the browser relaunched, the machine woken from sleep — came
+// back connected, and the extension, seeing a running backend, routed the
+// browser through it. Off now stays off until the user says otherwise.
+const savedWantRunningFile = "want-running.json"
+
+func (h *host) savedWantRunningPath() string {
+	return filepath.Join(h.ts.Dir, savedWantRunningFile)
+}
+
+type savedWantRunning struct {
+	WantRunning bool `json:"wantRunning"`
+}
+
+func writeSavedWantRunning(path string, want bool) error {
+	b, err := json.Marshal(savedWantRunning{WantRunning: want})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0600)
+}
+
+// readSavedWantRunning reports the saved switch, and whether one was saved
+// at all: a profile that has never been switched off has no file, and the
+// answer for it is the default, on.
+func readSavedWantRunning(path string) (want, saved bool, err error) {
+	b, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return true, false, nil
+	}
+	if err != nil {
+		return true, false, err
+	}
+	var s savedWantRunning
+	if err := json.Unmarshal(b, &s); err != nil {
+		return true, false, fmt.Errorf("parsing %s: %w", path, err)
+	}
+	return s.WantRunning, true, nil
+}
+
+// restoreWantRunning switches the backend off again if that is how the
+// previous process left it. Like restoreExitNode it runs before the IPN bus
+// watcher subscribes, so the first state the extension hears is the true
+// one, and it routes the browser — or leaves it direct — accordingly.
+func (h *host) restoreWantRunning(lc *local.Client) error {
+	want, saved, err := readSavedWantRunning(h.savedWantRunningPath())
+	if err != nil {
+		return err
+	}
+	if !saved || want {
+		return nil
+	}
+	h.logf("restoring the switch: off")
+	h.mu.Lock()
+	h.wantUp = false
+	h.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), localAPITimeout)
+	defer cancel()
+	if _, err := lc.EditPrefs(ctx, &ipn.MaskedPrefs{
+		WantRunningSet: true,
+		Prefs:          ipn.Prefs{WantRunning: false},
+	}); err != nil {
+		return fmt.Errorf("EditPrefs: %w", err)
 	}
 	return nil
 }
@@ -872,6 +948,9 @@ func (h *host) startTailscaleErr(ctx context.Context, id string) error {
 	if err := h.restoreExitNode(lc); err != nil {
 		h.logf("restoring exit node: %v", err)
 	}
+	if err := h.restoreWantRunning(lc); err != nil {
+		h.logf("restoring the switch: %v", err)
+	}
 	go h.watchIPNBus(ctx, lc)
 	return nil
 }
@@ -988,9 +1067,14 @@ func (h *host) scheduleStatus() {
 // hold up neither the IPN bus watcher nor the command reader.
 func (h *host) statusLoop() {
 	for range h.statusCh {
-		h.sendStatus()
+		h.emitStatus(false)
 	}
 }
+
+// sendStatus tells the extension where things stand. Callers here are
+// answering something — a command, the popup opening, the management page —
+// and a question deserves an answer even when nothing has changed.
+func (h *host) sendStatus() { h.emitStatus(true) }
 
 // send writes one native messaging frame: a little-endian length, then the
 // JSON. It is called from several goroutines — the reader answering a
@@ -1140,7 +1224,16 @@ func (h *host) userDial(ctx context.Context, netw, addr string) (net.Conn, error
 	return sys.Dialer.Get().UserDial(ctx, netw, addr)
 }
 
-func (h *host) sendStatus() {
+// emitStatus builds the status and sends it, unless force is false and it is
+// identical to the last one sent.
+//
+// The IPN bus reports anything that happens on the tailnet, and a tailnet of
+// any size is never quiet: peers come and go and the netmap is reissued, and
+// most of it arrives here as a status identical to the one before. Each
+// repeat cost the extension a redraw of the toolbar icon and a message to
+// the popup; the LocalAPI calls behind it are spent either way, but the
+// browser at least is left alone.
+func (h *host) emitStatus(force bool) {
 	st := &status{}
 	h.mu.Lock()
 	st.Running = h.lastState == ipn.Running
@@ -1153,7 +1246,12 @@ func (h *host) sendStatus() {
 	} else if !st.Running {
 		st.Error = "State: " + h.lastState.String()
 	}
-	if h.watchDead {
+	// Only where there is nothing else to say. The state string is not just
+	// display text: the extension reads "State: Stopped" to decide whether
+	// the browser goes through the proxy at all, and NeedsLogin is what puts
+	// the login link on screen. Neither may be overwritten by a watcher that
+	// is, in any case, being resubscribed.
+	if h.watchDead && st.Error == "" && !st.NeedsLogin {
 		st.Error = "WatchIPNBus stopped"
 	}
 	h.mu.Unlock()
@@ -1192,6 +1290,16 @@ func (h *host) sendStatus() {
 				return st.ExitNodes[i].Name < st.ExitNodes[j].Name
 			})
 			st.ExitNodeResolving = exitNodeResolving(prefsOK, prefID, prefIP, st.ExitNode != "")
+		}
+	}
+
+	if b, err := json.Marshal(st); err == nil {
+		h.mu.Lock()
+		repeat := !force && bytes.Equal(b, h.lastSentStatus)
+		h.lastSentStatus = b
+		h.mu.Unlock()
+		if repeat {
+			return
 		}
 	}
 

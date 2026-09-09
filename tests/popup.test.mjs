@@ -38,6 +38,15 @@ const backgroundStub = (api) => `
       },
     },
     tabs: { create: (o) => window.__sent.push({ tabCreate: o.url }) },
+    storage: {
+      local: {
+        get: (keys, cb) => {
+          const v = window.__cached ? { lastStatus: window.__cached } : {};
+          if (typeof cb === "function") { cb(v); return undefined; }
+          return Promise.resolve(v);
+        },
+      },
+    },
   };
 `;
 
@@ -282,8 +291,68 @@ for (const target of TARGETS) {
       const text = (await page.textContent("#state")).trim();
       assert.ok(text.includes("Reconnecting"), `got ${JSON.stringify(text)}`);
       assert.ok(!text.includes("--install"), "asked for an install while reconnecting");
-      assert.equal(await page.$eval("#toggleSlider", (e) => e.disabled), true);
+      // The toggle stays usable: a click is remembered by the background and
+      // delivered to the backend that arrives.
+      assert.equal(await page.$eval("#toggleSlider", (e) => e.disabled), false);
       assert.equal(await page.isVisible("#settingsButton"), false);
+      await page.close();
+    });
+
+    // Opening the panel after a wake means a new backend starting Tailscale
+    // from cold. The seconds spent blank read as broken; the last known
+    // status is painted at once, under a spinner, until something live
+    // arrives.
+    test("paints the cached status before the background answers", async () => {
+      const page = await browser.newPage({ viewport: { width: 360, height: 600 } });
+      await page.route("**/*", (route) => (route.request().url().startsWith("file://") ? route.continue() : route.abort()));
+      await page.addInitScript(backgroundStub(target.api));
+      await page.addInitScript((s) => (window.__cached = s), CONNECTED.status);
+      await page.goto("file://" + path.join(target.dir, "popup.html"));
+      await page.waitForFunction(() => document.readyState === "complete");
+      const text = (await page.textContent("#state")).trim();
+      assert.equal(text, "Connected as test@example.com");
+      assert.ok((await page.getAttribute(".slider", "class")).includes("loading"), "the cached state was shown as confirmed");
+
+      await page.evaluate((m) => window.__push(m), CONNECTED);
+      assert.ok(!(await page.getAttribute(".slider", "class")).includes("loading"), "the live answer did not clear the spinner");
+      await page.close();
+    });
+
+    test("the cache does not paint over a live answer", async () => {
+      const page = await browser.newPage({ viewport: { width: 360, height: 600 } });
+      await page.route("**/*", (route) => (route.request().url().startsWith("file://") ? route.continue() : route.abort()));
+      await page.addInitScript(backgroundStub(target.api));
+      await page.addInitScript((api) => {
+        // Storage that answers late, after the background has spoken.
+        const orig = window[api].storage.local.get;
+        window[api].storage.local.get = (k, cb) => {
+          setTimeout(() => orig(k, cb), 50);
+          return new Promise((r) => setTimeout(() => r({ lastStatus: window.__cached }), 50));
+        };
+        window.__cached = { running: true, tailnet: "stale" };
+      }, target.api);
+      await page.goto("file://" + path.join(target.dir, "popup.html"));
+      await page.evaluate((m) => window.__push(m), { installCmd: "go run x --install=C1" });
+      await page.waitForTimeout(150);
+      const text = await page.textContent("#state");
+      assert.ok(text.includes("--install=C1"), `the stale cache replaced the live install prompt: ${JSON.stringify(text)}`);
+      await page.close();
+    });
+
+    test("the toggle sends the state it was switched to", async () => {
+      const { page } = await open(target, CONNECTED); // switch is on
+      await page.$eval("#toggleSlider", (e) => e.click()); // the input is drawn as a slider
+      const sent = await page.evaluate(() => window.__sent);
+      const msg = sent.find((s) => s.command === "toggleProxy");
+      assert.ok(msg, "no toggleProxy was sent");
+      assert.equal(msg.enable, false, "switched off, but asked for something else");
+      await page.close();
+    });
+
+    test("an empty status reads as connecting, not as connected", async () => {
+      const { page } = await open(target, { status: {} });
+      const text = (await page.textContent("#state")).trim();
+      assert.ok(text.includes("Connecting"), `got ${JSON.stringify(text)}`);
       await page.close();
     });
 

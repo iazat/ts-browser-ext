@@ -84,7 +84,31 @@ document.addEventListener("DOMContentLoaded", () => {
   let isLoading = true;
   let hasReceivedInitialState = false;
 
+  // Whether the background has said anything yet. The cached status below and
+  // the port race each other, and the cache must not paint over a live answer.
+  let painted = false;
+
   const port = chrome.runtime.connect({ name: "popup" });
+
+  // Paint what was last true before the background gets a chance to answer.
+  // The browser discards the worker the background runs in, and the native
+  // backend dies with it, so opening this panel can mean waiting out a whole
+  // new backend starting Tailscale from cold. Those seconds spent blank read
+  // as an extension that is broken rather than one catching up. The spinner
+  // stays until something live arrives, so what is on screen is shown as what
+  // it is: the last thing known.
+  const paintCached = (cached) => {
+    if (!cached || !cached.lastStatus || painted || hasReceivedInitialState) {
+      return;
+    }
+    updateStatus(cached.lastStatus);
+    isLoading = true; // provisional until the background confirms it
+    hasReceivedInitialState = false;
+    updateSliderState();
+  };
+  chrome.storage.local.get("lastStatus", (cached) => {
+    if (!chrome.runtime.lastError) paintCached(cached);
+  });
 
   function updateSliderState() {
     if (isLoading) {
@@ -101,6 +125,10 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   function updateStatus(status) {
+    // The install and error branches disable these, and a status means
+    // there is a backend to talk to again.
+    toggleSlider.disabled = false;
+    settingsButton.hidden = false;
     isLoading = false;
     hasReceivedInitialState = true;
     if (status.error) {
@@ -119,12 +147,14 @@ document.addEventListener("DOMContentLoaded", () => {
         stateDisplay.textContent = "Connecting…";
         isLoading = true;
         updateSliderState();
+        renderExitNodes(status); // hides the picker while nothing is running
         return;
       }
       if (state === "NeedsMachineAuth") {
         stateDisplay.textContent = "Waiting for approval…";
         isLoading = true;
         updateSliderState();
+        renderExitNodes(status);
         return;
       }
       stateDisplay.textContent = `Error: ${status.error}`;
@@ -167,11 +197,19 @@ document.addEventListener("DOMContentLoaded", () => {
       isConnected = status.running;
       updateSliderState();
       renderExitNodes(status);
+      return;
     }
+    // A status with nothing in it: the backend is there but has not said a
+    // word about itself yet. Rendering none of the above left the panel blank
+    // under a toggle that still looked switched on.
+    stateDisplay.textContent = "Connecting…";
+    isLoading = true;
+    updateSliderState();
   }
 
   port.onMessage.addListener((msg) => {
     console.log("Received from background:", JSON.stringify(msg));
+    painted = true;
     if (msg.installCmd) {
       console.log("Received install command");
       stateDisplay.textContent = "";
@@ -194,14 +232,15 @@ document.addEventListener("DOMContentLoaded", () => {
       return;
     }
     // The backend went away and the background is bringing up a fresh one.
-    // It is not missing, so no install command; and the toggle is left
-    // disabled until there is something on the other end of it.
+    // It is not missing, so no install command. The toggle stays usable: a
+    // click now is remembered by the background and delivered to the backend
+    // that arrives.
     if (msg.reconnecting) {
       console.log("Backend restarting");
       stateDisplay.textContent = "Reconnecting to the backend…";
       isLoading = true;
       updateSliderState();
-      toggleSlider.disabled = true;
+      toggleSlider.disabled = false;
       settingsButton.hidden = true;
       exitNodeRow.hidden = true;
       return;
@@ -223,7 +262,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
   toggleSlider.addEventListener("change", () => {
     console.log("Toggle slider changed, current state:", isConnected);
-    chrome.runtime.sendMessage({ command: "toggleProxy" }, (response) => {
+    // The state of the switch after the click is what the user asked for. The
+    // background used to invert its own idea of the state, and a worker that
+    // had just restarted had no idea at all.
+    chrome.runtime.sendMessage({ command: "toggleProxy", enable: toggleSlider.checked }, (response) => {
       console.log("Received response from background:", response);
       if (response && response.status) {
         updateStatus(response.status);

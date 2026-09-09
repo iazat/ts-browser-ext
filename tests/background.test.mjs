@@ -209,9 +209,12 @@ for (const target of TARGETS) {
       }
     });
 
-    test("shows the install prompt with its own browser byte", () => {
+    test("shows the install prompt with its own browser byte", async () => {
       const { calls } = loadBackground(target.file, target.flavor);
       // No native host has answered yet, so the port is still considered dead.
+      // Until the profile read settles that reads as a reconnect, not an
+      // install; let it settle.
+      await new Promise((r) => setImmediate(r));
       connectPopup(calls);
 
       const prompt = calls.toPopup.find((m) => m.installCmd);
@@ -229,7 +232,7 @@ for (const target of TARGETS) {
     // browser, an extension or the user says it is. Getting it wrong prints a
     // command that registers the native host under the other browser's name,
     // after which the popup still asks to install it.
-    test("names its own browser whatever the environment claims", () => {
+    test("names its own browser whatever the environment claims", async () => {
       const otherGlobal = target.name === "chrome" ? "browser" : "chrome";
       const otherAgent =
         target.name === "chrome"
@@ -238,9 +241,9 @@ for (const target of TARGETS) {
             "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
 
       const { calls } = loadBackground(target.file, target.flavor, {
-        [otherGlobal]: {},
-        navigator: { userAgent: otherAgent },
+        globals: { [otherGlobal]: {}, navigator: { userAgent: otherAgent } },
       });
+      await new Promise((r) => setImmediate(r));
       connectPopup(calls);
 
       const { installCmd } = calls.toPopup.find((m) => m.installCmd);
@@ -384,8 +387,9 @@ for (const target of TARGETS) {
       assert.ok(!calls.toPopup.some((m) => m.installCmd), "popup was asked to install a host that was working a moment ago");
     });
 
-    test("puts the browser's reason next to the install prompt", () => {
+    test("puts the browser's reason next to the install prompt", async () => {
       const { sandbox, calls } = loadBackground(target.file, target.flavor);
+      await new Promise((r) => setImmediate(r));
       const message = "Native host has exited.";
       // Chrome reports through runtime.lastError, Firefox on the port.
       if (target.flavor === "chrome") sandbox.chrome.runtime.lastError = { message };
@@ -413,11 +417,207 @@ for (const target of TARGETS) {
       assert.ok(shown.status.error.includes("read-only"), shown.status.error);
     });
 
+    // ---- Coming back after the machine sleeps ----
+    //
+    // Sleep takes the whole chain down: the browser suspends, the worker is
+    // discarded, and the host, its child process, dies with it. A timer set
+    // by this script dies with the worker too, so the retry has to be held by
+    // the browser — an alarm, or the idle state flipping back to active.
+
+    test("asks the browser for a periodic alarm and listens for it", () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      assert.equal(calls.alarmsCreated.length, 1, "no alarm was registered");
+      assert.ok(calls.alarmsCreated[0].periodInMinutes >= 1);
+      assert.equal(typeof calls.onAlarm, "function", "no alarms.onAlarm listener");
+      assert.equal(typeof calls.onIdle, "function", "no idle.onStateChanged listener");
+    });
+
+    test("an alarm reconnects a dead port and leaves a live one alone", () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      bringUp(calls);
+      const live = calls.connects;
+      calls.onAlarm({ name: calls.alarmsCreated[0].name });
+      assert.equal(calls.connects, live, "a healthy connection was replaced on an alarm");
+
+      calls.onNativeDisconnect();
+      calls.onAlarm({ name: calls.alarmsCreated[0].name });
+      assert.equal(calls.connects, live + 1, "the alarm did not reconnect a dead port");
+    });
+
+    test("the machine becoming active reconnects a dead port at once", () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      bringUp(calls);
+      calls.onNativeDisconnect();
+      const before = calls.connects;
+      calls.onIdle("active");
+      assert.equal(calls.connects, before + 1);
+      assert.equal(calls.timers.filter((t) => t.ms >= 1000).length, 0, "the backoff timer was left armed beside the immediate reconnect");
+    });
+
+    test("opening the popup while the port is dead reconnects at once", () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      bringUp(calls);
+      calls.onNativeDisconnect();
+      const before = calls.connects;
+      connectPopup(calls);
+      assert.equal(calls.connects, before + 1, "someone is looking; the backoff should not be sat out");
+    });
+
+    // ---- The backend gets the last word on whether to route ----
+    //
+    // The backend remembers its switch on disk; a fresh worker remembers
+    // nothing. Routing on procRunning switched the tailnet back on for people
+    // who had switched it off.
+
+    test("procRunning alone does not route; the first status decides", () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      calls.onNativeMessage({ procRunning: { port: 41234 } });
+      assert.ok(!target.isProxied(calls), "routed on sight, before the backend said whether it is on");
+
+      calls.onNativeMessage({ status: { running: true, tailnet: "t" } });
+      assert.ok(target.isProxied(calls), "a running backend should be routed through");
+    });
+
+    test("a backend that comes back switched off leaves the browser direct", () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      calls.onNativeMessage({ procRunning: { port: 41234 } });
+      calls.onNativeMessage({ status: { running: false, error: "State: Stopped" } });
+      assert.ok(!target.isProxied(calls), "routed into a backend that reports Stopped");
+    });
+
+    test("a backend still coming up is routed, so nothing leaves direct", () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      calls.onNativeMessage({ procRunning: { port: 41234 } });
+      calls.onNativeMessage({ status: { running: false, error: "State: Starting" } });
+      assert.ok(target.isProxied(calls), "left on a direct connection while the backend starts; with an exit node that is a leak");
+    });
+
+    test("a replacement host takes the browser back the moment it has a port", () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      bringUp(calls, 41234);
+      calls.onNativeDisconnect();
+      fireTimers(calls);
+      calls.onNativeMessage({ procRunning: { port: 41235 } }); // no status yet
+      assert.ok(target.isProxied(calls), "the browser that was going through the dead host was left direct until the new one finished starting");
+    });
+
+    test("off stays off across a restart, whatever the backend reports", async () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      bringUp(calls);
+      await sendCommand(calls, { command: "toggleProxy", enable: false });
+      assert.ok(!target.isProxied(calls));
+
+      calls.onNativeDisconnect();
+      fireTimers(calls);
+      bringUp(calls, 41235); // reports running
+      assert.ok(!target.isProxied(calls), "the user's off was overruled by the backend");
+    });
+
+    test("a switch flipped while the backend is away is delivered to the next one", async () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      bringUp(calls);
+      calls.onNativeDisconnect();
+      await sendCommand(calls, { command: "toggleProxy", enable: true });
+      fireTimers(calls);
+      calls.toNativeHost.length = 0;
+      await new Promise((r) => setImmediate(r));
+      calls.onNativeMessage({ procRunning: { port: 41235 } });
+
+      const cmds = calls.toNativeHost.map((m) => m.cmd);
+      assert.ok(cmds.indexOf("init") !== -1, "no init for the replacement");
+      assert.ok(cmds.indexOf("up") > cmds.indexOf("init"), `up must follow init, got ${cmds}`);
+      assert.ok(target.isProxied(calls));
+    });
+
+    test("the toggle honours the state the popup sends", async () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      bringUp(calls);
+      calls.toNativeHost.length = 0;
+      await sendCommand(calls, { command: "toggleProxy", enable: true }); // already on
+      assert.ok(calls.toNativeHost.some((m) => m.cmd === "up"), "asked for on, sent nothing");
+      assert.ok(!calls.toNativeHost.some((m) => m.cmd === "down"), "asked for on, sent down");
+    });
+
+    // ---- Storage that answers nothing ----
+
+    test("survives storage refusing to answer, and inits once it does", async () => {
+      // Two refusals: the read at start, and the one a backend's first
+      // message provokes. Neither may throw, invent an id, or send init.
+      const { calls } = loadBackground(target.file, target.flavor, { storageFailures: 2 });
+      await new Promise((r) => setImmediate(r));
+      calls.onNativeMessage({ procRunning: { port: 41234 } });
+      await new Promise((r) => setImmediate(r));
+      assert.ok(!calls.toNativeHost.some((m) => m.cmd === "init"), "sent init with no profile id");
+      assert.ok(calls.timers.length > 0, "no retry of the refused read");
+
+      fireTimers(calls); // the read that works
+      await new Promise((r) => setImmediate(r));
+      const init = calls.toNativeHost.find((m) => m.cmd === "init");
+      assert.ok(init, "never sent init after storage answered");
+      assert.equal(init.initID, "test-profile-id");
+    });
+
+    test("never invents a profile id over a refused read", async () => {
+      const { calls } = loadBackground(target.file, target.flavor, { storageFailures: 1 });
+      await new Promise((r) => setImmediate(r));
+      assert.equal(calls.storage.profileId, "test-profile-id", "the stored id was replaced");
+    });
+
+    // ---- What the popup is told on a fresh worker ----
+
+    test("a fresh worker in a profile that has seen a backend says reconnecting", async () => {
+      const { calls } = loadBackground(target.file, target.flavor, {
+        storage: { profileId: "test-profile-id", hostSeen: true },
+      });
+      await new Promise((r) => setImmediate(r));
+      calls.onNativeDisconnect(); // the first connect failed
+      connectPopup(calls);
+      assert.ok(calls.toPopup.some((m) => m.reconnecting), "told to install a backend it has used before");
+      assert.ok(!calls.toPopup.some((m) => m.installCmd));
+    });
+
+    test("gives up on the reconnect story once connects keep failing", async () => {
+      const { calls } = loadBackground(target.file, target.flavor, {
+        storage: { profileId: "test-profile-id", hostSeen: true },
+      });
+      await new Promise((r) => setImmediate(r));
+      for (let i = 0; i < 5; i++) {
+        calls.onNativeDisconnect();
+        fireTimers(calls);
+      }
+      connectPopup(calls);
+      assert.ok(calls.toPopup.some((m) => m.installCmd), "kept promising a reconnect for a backend that is gone");
+    });
+
+    test("remembers that a backend answered, for the next worker", async () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      bringUp(calls);
+      await new Promise((r) => setImmediate(r));
+      assert.equal(calls.storage.hostSeen, true);
+    });
+
+    test("caches the last status for the popup to paint early", async () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      bringUp(calls);
+      await new Promise((r) => setImmediate(r));
+      assert.equal(calls.storage.lastStatus && calls.storage.lastStatus.tailnet, "test@example.com");
+    });
+
+    test("does not redraw the icon for a status that changes nothing", () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      bringUp(calls);
+      const drawn = calls.icons.length;
+      bringUp(calls);
+      bringUp(calls);
+      assert.equal(calls.icons.length, drawn, "the toolbar was redrawn for identical statuses");
+    });
+
     // This fork's native host understands set-exit-node and reports exitNodes;
     // upstream's does not. Pointing people at the wrong module hands them a
     // host that half-works, with no hint as to why, so pin it to this repo.
-    test("the install prompt installs this fork, not upstream", () => {
+    test("the install prompt installs this fork, not upstream", async () => {
       const { calls } = loadBackground(target.file, target.flavor);
+      await new Promise((r) => setImmediate(r));
       connectPopup(calls);
 
       const { installCmd } = calls.toPopup.find((m) => m.installCmd);
