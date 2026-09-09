@@ -107,14 +107,20 @@ extension's own ID:
 
 	h := newHost(os.Stdin, os.Stdout)
 
+	// Running under the browser, stdout is the protocol and stderr goes
+	// nowhere anyone looks. Log to a file beside the state instead, or to a
+	// local syslog when one is listening (the original debugging setup).
 	if w, err := dialDebugSyslog(); err == nil {
 		log.Printf("syslog dialed")
 		h.logf = func(f string, a ...any) {
 			fmt.Fprintf(w, f, a...)
 		}
 		log.SetOutput(w)
+	} else if w, path, err := openLogFile(); err == nil {
+		log.SetOutput(w)
+		log.Printf("ts-browser-ext pid %d logging to %s", os.Getpid(), path)
 	} else {
-		log.Printf("syslog: %v", err)
+		log.Printf("log file: %v", err)
 	}
 
 	ln := h.getProxyListener()
@@ -131,6 +137,55 @@ extension's own ID:
 	err := h.readMessages()
 	h.logf("readMessage loop ended: %v", err)
 	h.shutdown()
+}
+
+// logFileName is the backend's log, truncated at every start so it holds the
+// current process's life and nothing older, under the same directory the
+// profiles' state lives in. logFileLimit stops a long session filling the
+// disk: tsnet is talkative.
+const (
+	logFileName  = "backend.log"
+	logFileLimit = 20 << 20
+)
+
+// openLogFile opens the log for writing, truncating what a previous process
+// left. The returned writer stops writing, silently, past logFileLimit.
+func openLogFile() (io.Writer, string, error) {
+	confDir, err := os.UserConfigDir()
+	if err != nil {
+		return nil, "", err
+	}
+	dir := filepath.Join(confDir, "tailscale-browser-ext")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return nil, "", err
+	}
+	path := filepath.Join(dir, logFileName)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return nil, "", err
+	}
+	return &cappedWriter{w: f, left: logFileLimit}, path, nil
+}
+
+// cappedWriter passes writes through until left is spent, then drops them.
+type cappedWriter struct {
+	mu   sync.Mutex
+	w    io.Writer
+	left int
+}
+
+func (c *cappedWriter) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.left <= 0 {
+		return len(p), nil
+	}
+	if len(p) > c.left {
+		p = p[:c.left]
+	}
+	n, err := c.w.Write(p)
+	c.left -= n
+	return len(p), err
 }
 
 // shutdownTimeout bounds how long exiting waits for tsnet to close. The
@@ -471,6 +526,7 @@ func (h *host) handleSetExitNode(msg *request) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), localAPITimeout)
 	defer cancel()
+	h.logf("extension: set exit node to %q", msg.ExitNode)
 	return h.setExitNode(ctx, lc, msg.ExitNode)
 }
 
@@ -480,6 +536,7 @@ func (h *host) setExitNode(ctx context.Context, lc *local.Client, name string) e
 	if err != nil {
 		return err
 	}
+	h.logf("exit node now id=%q ip=%v; remembering in %s", prefs.ExitNodeID, prefs.ExitNodeIP, h.savedExitNodePath())
 	if err := writeSavedExitNode(h.savedExitNodePath(), prefs); err != nil {
 		h.logf("remembering exit node: %v", err)
 	}
@@ -1276,6 +1333,26 @@ type webData struct {
 	Version  string    `json:"version"`
 	ExitNode string    `json:"exitNode"`
 	Peers    []webPeer `json:"peers"`
+
+	// Diagnostics for the exit node, which has a history of going missing:
+	// what the backend's preferences say right now, and what is on disk to
+	// be put back at the next start.
+	ExitNodePrefs webExitNodePrefs `json:"exitNodePrefs"`
+	SavedExitNode webExitNodePrefs `json:"savedExitNode"`
+	Pid           int              `json:"pid"`
+	LogFile       string           `json:"logFile"`
+}
+
+type webExitNodePrefs struct {
+	ID string `json:"id"`
+	IP string `json:"ip"`
+}
+
+func ipString(a netip.Addr) string {
+	if !a.IsValid() {
+		return ""
+	}
+	return a.String()
 }
 
 type webPeer struct {
@@ -1332,6 +1409,16 @@ func (h *host) serveInternalData(w http.ResponseWriter, r *http.Request) {
 		d.SelfIP = firstIP(st.Self.TailscaleIPs)
 	}
 	prefID, prefIP, _ := configuredExitNode(lc, h.logf)
+	d.ExitNodePrefs = webExitNodePrefs{ID: string(prefID), IP: ipString(prefIP)}
+	if saved, err := readSavedExitNode(h.savedExitNodePath()); err == nil {
+		d.SavedExitNode = webExitNodePrefs{ID: string(saved.ID), IP: ipString(saved.IP)}
+	} else {
+		d.SavedExitNode = webExitNodePrefs{ID: "error: " + err.Error()}
+	}
+	d.Pid = os.Getpid()
+	if confDir, err := os.UserConfigDir(); err == nil {
+		d.LogFile = filepath.Join(confDir, "tailscale-browser-ext", logFileName)
+	}
 	for _, ps := range st.Peer {
 		if isConfiguredExitNode(ps, prefID, prefIP) {
 			d.ExitNode = machineName(ps.DNSName, ps.HostName)
@@ -1361,6 +1448,7 @@ func (h *host) serveInternalSetExitNode(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
+	h.logf("management page: set exit node to %q", body.ExitNode)
 	if err := h.setExitNode(r.Context(), lc, body.ExitNode); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
