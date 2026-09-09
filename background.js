@@ -135,16 +135,31 @@ function sendPopupStatus() {
   if (deadPort) {
     setPopupIcon("need-install");
     console.log("sendPopupStatus... no nmPort");
+    // A host that answered earlier in this worker's life and then went away
+    // is being restarted, not missing: asking for an install there sends the
+    // user to re-run a command that changes nothing. Only a host that has
+    // never answered gets the install prompt, with the browser's reason for
+    // the failure next to it, since "not found" and "exited" want different
+    // fixes.
+    if (everConnected) {
+      sendToPopup({ reconnecting: true, error: portError });
+      return;
+    }
     sendToPopup({
       installCmd:
         "go run github.com/iazat/ts-browser-ext@latest --install=" +
         browserByte() +
         chrome.runtime.id,
+      error: portError,
     });
     return;
   }
   setPopupIcon(proxyEnabled ? "online" : "offline");
 
+  if (lastInitError) {
+    sendToPopup({ status: { error: "Backend failed to start: " + lastInitError } });
+    return;
+  }
   sendToPopup({ status: lastStatus });
 }
 
@@ -155,52 +170,144 @@ function sendToPopup(v) {
 }
 
 let nmPort = null; // even non-null if lacking permission
+// deadPort means no live backend has answered on nmPort. It is only cleared
+// by a message, so it stays set while a freshly spawned host is still
+// starting; nmPortClosed is the narrower fact that the browser has reported
+// nmPort disconnected, which is what decides whether a new one may be opened.
 let deadPort = true;
+let nmPortClosed = true;
 let portError = null;
+// everConnected records that a native host answered at least once since this
+// worker started, which is what tells a restart apart from a missing install.
+let everConnected = false;
+// lastInitError is the backend's reason for failing to start tsnet, shown in
+// the popup until a host starts cleanly.
+let lastInitError = null;
+
+// Reconnection is retried with backoff rather than at a fixed second. A host
+// that is missing fails instantly and would otherwise be tried every second
+// for as long as the browser runs; one that is crashing on start gets the same
+// treatment. Any answer from a host resets the delay.
+const reconnectDelayMin = 1000;
+const reconnectDelayMax = 30000;
+let reconnectDelay = reconnectDelayMin;
+let reconnectTimer = null;
+
+function scheduleReconnect() {
+  if (reconnectTimer !== null || !nmPortClosed) {
+    return;
+  }
+  console.log("Reconnecting to native host in " + reconnectDelay + "ms");
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectToNativeHost();
+  }, reconnectDelay);
+  reconnectDelay = Math.min(reconnectDelay * 2, reconnectDelayMax);
+}
 
 connectToNativeHost();
 
+// The port to the native host is what keeps this service worker alive
+// (Chrome 105+). When the host goes away the port closes, and unless it is
+// reopened the worker is shut down after its idle timer — with the browser's
+// proxy setting, which persists on its own, still pointing at the dead port.
+// Chrome's own advice is to reconnect from onDisconnect; these two events
+// cover the worker being started fresh, at browser launch and after an
+// update, when there is no onDisconnect to reconnect from.
+chrome.runtime.onStartup.addListener(() => {
+  console.log("Browser started");
+  connectToNativeHost();
+});
+chrome.runtime.onInstalled.addListener(() => {
+  console.log("Extension installed or updated");
+  connectToNativeHost();
+});
+
 function connectToNativeHost() {
-  if (nmPort && !deadPort) {
+  // One host at a time. The old test here was "has a host answered", which
+  // is false for the first moments after connectNative while the new
+  // process is still starting — so a reconnect timer firing in that window
+  // opened a second host, and the first, never disconnected, ran on as an
+  // orphan with the browser pointed at whichever answered last.
+  if (nmPort && !nmPortClosed) {
     return;
   }
+  if (reconnectTimer !== null) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
   console.log("Connecting to native messaging host...");
-  nmPort = chrome.runtime.connectNative("io.github.iazat.tailext.chrome");
+  const port = chrome.runtime.connectNative("io.github.iazat.tailext.chrome");
+  nmPort = port;
+  nmPortClosed = false;
 
-  nmPort.onDisconnect.addListener(() => {
+  port.onDisconnect.addListener(() => {
+    if (port !== nmPort) {
+      // A port we already replaced; its news is stale.
+      return;
+    }
+    nmPortClosed = true;
+    const error = chrome.runtime.lastError;
     deadPort = true;
     nativeProxyPort = 0; // the host is gone, and so is the port it was listening on
+    // Whatever replaces it is a fresh process that knows nothing: it has to
+    // be sent init again, and the status we were holding is that of a host
+    // that no longer exists. Leaving didInit set here is how a restarted
+    // backend used to sit forever without tsnet, the popup reading
+    // "Connecting…" and every page failing, until the extension was reloaded.
+    didInit = false;
+    lastStatus = {};
     setPopupIcon("need-install");
     disableProxy();
-    const error = chrome.runtime.lastError;
     if (error) {
       console.error("Connection failed:", error.message);
       portError = error.message;
-      setTimeout(connectToNativeHost, 1000);
     } else {
       console.error("Disconnected from native host");
+      portError = null;
     }
+    sendPopupStatus();
+    // Reconnect whether or not the browser reported a reason. A host that
+    // exited cleanly needs replacing just as much as one that crashed, and
+    // the old rule of only retrying on an error left the browser without a
+    // backend after the former.
+    scheduleReconnect();
   });
-  nmPort.onMessage.addListener((message) => {
+  port.onMessage.addListener((message) => {
     console.log("got message: " + JSON.stringify(message));
     if (deadPort) {
       console.log("connected to native backend");
       deadPort = false;
     }
+    everConnected = true;
+    portError = null;
+    reconnectDelay = reconnectDelayMin;
     if (message.procRunning) {
       if (message.procRunning.port) {
         nativeProxyPort = message.procRunning.port;
         setProxy(message.procRunning.port);
-      } else if (message.procRunning.errror) {
+      } else if (message.procRunning.error) {
         console.log(
-          "procRunning error from backend: " + message.procRunning.err
+          "procRunning error from backend: " + message.procRunning.error
         );
         disableProxy();
       }
     }
-    if (message.init && message.init.error) {
-      console.log("init error from backend: " + message.init.err);
-      disableProxy();
+    if (message.init) {
+      if (message.init.error) {
+        console.log("init error from backend: " + message.init.error);
+        lastInitError = message.init.error;
+        disableProxy();
+      } else {
+        lastInitError = null;
+      }
+    }
+    if (message.cmdError) {
+      // The backend carries on after a failed command; the status that
+      // follows shows where things stand. Worth a line in the console.
+      console.error(
+        "backend could not run " + message.cmdError.cmd + ": " + message.cmdError.error
+      );
     }
     if (message.status) {
       lastStatus = message.status;

@@ -29,12 +29,35 @@ export function loadBackground(file, flavor, extraGlobals = {}) {
     toNativeHost: [], //   messages posted to the native messaging port
     toPopup: [], //        messages posted down the popup port
     icons: [], //          icon base names the script asked for
+    connects: 0, //        connectNative calls so far
+    timers: [], //         {fn, ms} for every setTimeout the script set
   };
 
-  const nativePort = {
-    postMessage: (m) => calls.toNativeHost.push(m),
-    onDisconnect: { addListener: (f) => (calls.onNativeDisconnect = f) },
-    onMessage: { addListener: (f) => (calls.onNativeMessage = f) },
+  // Each connectNative call hands back a fresh port, as the browser does; the
+  // most recent one's listeners are what calls.onNativeDisconnect and
+  // calls.onNativeMessage refer to. A port's `error` is Firefox's way of
+  // reporting why it disconnected; tests set it before firing onDisconnect.
+  let nativePort = null;
+  const newNativePort = () => {
+    const port = {
+      error: null,
+      postMessage: (m) => calls.toNativeHost.push(m),
+      onDisconnect: {
+        addListener: (f) => {
+          port.disconnect = f;
+          calls.onNativeDisconnect = f;
+        },
+      },
+      onMessage: {
+        addListener: (f) => {
+          port.message = f;
+          calls.onNativeMessage = f;
+        },
+      },
+    };
+    nativePort = port;
+    calls.nativePort = port;
+    return port;
   };
 
   const api = {
@@ -63,9 +86,15 @@ export function loadBackground(file, flavor, extraGlobals = {}) {
     runtime: {
       id: "test-extension-id",
       lastError: null,
-      connectNative: (name) => ((calls.nativeHostName = name), nativePort),
+      connectNative: (name) => {
+        calls.nativeHostName = name;
+        calls.connects++;
+        return newNativePort();
+      },
       onConnect: { addListener: (f) => (calls.onConnect = f) },
       onMessage: { addListener: (f) => (calls.onMessage = f) },
+      onStartup: { addListener: (f) => (calls.onStartup = f) },
+      onInstalled: { addListener: (f) => (calls.onInstalled = f) },
     },
     storage: {
       local: {
@@ -80,7 +109,17 @@ export function loadBackground(file, flavor, extraGlobals = {}) {
   const sandbox = {
     [flavor]: api,
     console: { log() {}, error() {}, warn() {} },
-    setTimeout: () => 0,
+    // Timers are recorded, not run: a test that wants one to fire calls
+    // its fn itself, so reconnect scheduling can be asserted without waiting.
+    setTimeout: (fn, ms) => {
+      const t = { fn, ms };
+      calls.timers.push(t);
+      return t;
+    },
+    clearTimeout: (t) => {
+      const i = calls.timers.indexOf(t);
+      if (i !== -1) calls.timers.splice(i, 1);
+    },
     crypto: { randomUUID: () => "test-uuid" },
     URL,
     Promise,
@@ -90,6 +129,14 @@ export function loadBackground(file, flavor, extraGlobals = {}) {
   vm.runInContext(fs.readFileSync(file, "utf8"), sandbox, { filename: file });
 
   return { sandbox, calls, nativePort };
+}
+
+// fireTimers runs every timer the script has set so far, once, in order.
+// Timers set while running are left for the next call.
+export function fireTimers(calls) {
+  const due = calls.timers.splice(0);
+  for (const { fn } of due) fn();
+  return due.length;
 }
 
 // plain copies a value out of the sandbox realm. Objects built inside the vm

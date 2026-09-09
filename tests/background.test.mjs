@@ -7,7 +7,7 @@ import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadBackground, connectPopup, sendCommand, plain } from "./webext-mock.mjs";
+import { loadBackground, connectPopup, sendCommand, plain, fireTimers } from "./webext-mock.mjs";
 
 const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 
@@ -256,6 +256,163 @@ for (const target of TARGETS) {
       );
     });
 
+    // Every native host is a fresh process that knows nothing until it is sent
+    // init. The flag that stops init being sent twice used to survive the
+    // host dying, so its replacement was never told to start tsnet: it sat
+    // reporting NoState, the popup read "Connecting…" for good, and every
+    // page failed with "no tsnet.Server" until the extension was reloaded.
+    test("sends init again to the host that replaces a dead one", async () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      // Firefox's storage API answers through a promise, so the profile id
+      // is only known after a turn of the microtask queue.
+      await new Promise((r) => setImmediate(r));
+      bringUp(calls);
+      assert.equal(
+        calls.toNativeHost.filter((m) => m.cmd === "init").length,
+        1,
+        "expected exactly one init for the first host"
+      );
+
+      calls.onNativeDisconnect();
+      fireTimers(calls); // the reconnect
+      calls.toNativeHost.length = 0;
+      bringUp(calls, 41235);
+
+      const inits = calls.toNativeHost.filter((m) => m.cmd === "init");
+      assert.equal(inits.length, 1, "the replacement host was never sent init");
+      assert.equal(inits[0].initID, "test-profile-id");
+    });
+
+    test("does not offer a dead host's status as the new one's", () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      bringUp(calls);
+      calls.onNativeDisconnect();
+      calls.toPopup.length = 0;
+
+      connectPopup(calls);
+
+      const stale = calls.toPopup.find((m) => m.status && m.status.running);
+      assert.equal(stale, undefined, "the popup was shown the status of a host that no longer exists");
+    });
+
+    // Chrome's own guidance: the native port is what keeps the worker alive,
+    // so reconnect from onDisconnect. That used to happen only when the
+    // browser attached an error to the disconnect. A host that exited on its
+    // own — its stdin closed, its init failed — reported no error on some
+    // paths, and the extension stayed without a backend until reloaded.
+    test("reconnects after a disconnect that carries no error", () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      bringUp(calls);
+      const before = calls.connects;
+
+      calls.onNativeDisconnect(); // lastError is null, port.error is null
+      assert.ok(calls.timers.length > 0, "no reconnect was scheduled");
+      fireTimers(calls);
+
+      assert.equal(calls.connects, before + 1, "connectNative was not called again");
+    });
+
+    // connectNative spawns the host, and its first message — the one that
+    // marks the port live — arrives some hundreds of milliseconds later. A
+    // reconnect timer firing in that window used to open a second host and
+    // abandon the first, still running, with the browser pointed at whichever
+    // reported its port last.
+    test("does not open a second host while the first is still starting", () => {
+      const { sandbox, calls } = loadBackground(target.file, target.flavor);
+      calls.onNativeDisconnect(); // the first attempt found no host
+      fireTimers(calls); // the reconnect spawns one
+      const after = calls.connects;
+
+      sandbox.connectToNativeHost(); // e.g. runtime.onStartup, or another timer
+      assert.equal(calls.connects, after, "a second host was spawned while the first was starting");
+
+      calls.onNativeMessage({ procRunning: { port: 41234 } });
+      sandbox.connectToNativeHost();
+      assert.equal(calls.connects, after, "a second host was spawned next to a live one");
+    });
+
+    test("connecting explicitly cancels a pending reconnect timer", () => {
+      const { sandbox, calls } = loadBackground(target.file, target.flavor);
+      calls.onNativeDisconnect();
+      assert.equal(calls.timers.length, 1);
+      sandbox.connectToNativeHost();
+      assert.equal(calls.timers.length, 0, "the timer would have spawned a second host");
+    });
+
+    test("backs off between failed reconnects and resets once a host answers", () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      const delays = [];
+      for (let i = 0; i < 6; i++) {
+        calls.onNativeDisconnect();
+        assert.equal(calls.timers.length, 1, `attempt ${i}: expected one pending reconnect`);
+        delays.push(calls.timers[0].ms);
+        fireTimers(calls);
+      }
+      for (let i = 1; i < delays.length; i++) {
+        assert.ok(delays[i] >= delays[i - 1], `delays should not shrink: ${delays}`);
+      }
+      assert.ok(delays.at(-1) > delays[0], `delays never grew: ${delays}`);
+      assert.ok(delays.at(-1) <= 30000, `delay grew past the cap: ${delays}`);
+
+      bringUp(calls);
+      calls.onNativeDisconnect();
+      assert.equal(calls.timers[0].ms, delays[0], "a host answering should reset the backoff");
+    });
+
+    test("wakes up and reconnects at browser start", () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      assert.equal(typeof calls.onStartup, "function", "no runtime.onStartup listener: the worker will not run at browser start, and the proxy setting it left behind points at nothing");
+      assert.equal(typeof calls.onInstalled, "function", "no runtime.onInstalled listener");
+      calls.onNativeDisconnect();
+      const before = calls.connects;
+      calls.onStartup();
+      assert.equal(calls.connects, before + 1);
+    });
+
+    // A host that answered and then went away is being replaced, not
+    // installed. Telling the user to run the install command there sends
+    // them to redo something that is already done.
+    test("tells the popup it is reconnecting rather than asking for an install", () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      bringUp(calls);
+      calls.onNativeDisconnect();
+      calls.toPopup.length = 0;
+
+      connectPopup(calls);
+
+      assert.ok(calls.toPopup.some((m) => m.reconnecting), "popup was not told about the reconnect");
+      assert.ok(!calls.toPopup.some((m) => m.installCmd), "popup was asked to install a host that was working a moment ago");
+    });
+
+    test("puts the browser's reason next to the install prompt", () => {
+      const { sandbox, calls } = loadBackground(target.file, target.flavor);
+      const message = "Native host has exited.";
+      // Chrome reports through runtime.lastError, Firefox on the port.
+      if (target.flavor === "chrome") sandbox.chrome.runtime.lastError = { message };
+      else calls.nativePort.error = { message };
+      calls.onNativeDisconnect();
+      if (target.flavor === "chrome") sandbox.chrome.runtime.lastError = null;
+
+      connectPopup(calls);
+
+      const prompt = calls.toPopup.find((m) => m.installCmd);
+      assert.ok(prompt, "no install prompt was sent");
+      assert.equal(prompt.error, message);
+    });
+
+    test("surfaces a failed backend start in the popup", () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      calls.onNativeMessage({ procRunning: { port: 41234 } });
+      calls.onNativeMessage({ init: { error: "starting tsnet.Server: state dir is read-only" } });
+      calls.toPopup.length = 0;
+
+      connectPopup(calls);
+
+      const shown = calls.toPopup.find((m) => m.status && m.status.error);
+      assert.ok(shown, "the popup was not told the backend failed to start");
+      assert.ok(shown.status.error.includes("read-only"), shown.status.error);
+    });
+
     // This fork's native host understands set-exit-node and reports exitNodes;
     // upstream's does not. Pointing people at the wrong module hands them a
     // host that half-works, with no hint as to why, so pin it to this repo.
@@ -275,6 +432,25 @@ for (const target of TARGETS) {
     });
   });
 }
+
+describe("firefox: native port lifecycle", () => {
+  const { file, flavor } = TARGETS.find((t) => t.name === "firefox");
+
+  // Firefox reports a disconnect's cause on the port, not in runtime.lastError,
+  // which is Chrome's channel and is undefined in a promise-based API. Reading
+  // only lastError meant a crashed host looked like a clean disconnect.
+  test("reads the disconnect reason from port.error", () => {
+    const { calls } = loadBackground(file, flavor);
+    bringUp(calls);
+    calls.nativePort.error = { message: "No such native application io.github.iazat.tailext.firefox" };
+    calls.onNativeDisconnect();
+
+    connectPopup(calls);
+    const told = calls.toPopup.find((m) => m.reconnecting);
+    assert.ok(told, "popup was not told about the disconnect");
+    assert.match(told.error, /No such native application/);
+  });
+});
 
 describe("firefox: proxy.onRequest handler lifecycle", () => {
   const { file, flavor } = TARGETS.find((t) => t.name === "firefox");

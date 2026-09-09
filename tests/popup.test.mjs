@@ -178,6 +178,42 @@ for (const target of TARGETS) {
       await page.close();
     });
 
+    // A status arrives every few seconds. Rebuilding the picker's options
+    // under an open menu made the browser commit whatever ended up at the
+    // clicked position when the menu closed — None — and that went to the
+    // backend as "stop using an exit node" from a user who touched nothing.
+    test("leaves the picker alone while the user is in it", async () => {
+      const { page } = await open(target, CONNECTED);
+      await page.focus("#exitNodeSelect");
+      const before = await page.$eval("#exitNodeSelect", (e) => e.value);
+
+      await page.evaluate((m) => window.__push(m), {
+        status: { ...CONNECTED.status, exitNode: "fra.tail1234.ts.net" },
+      });
+      assert.equal(
+        await page.$eval("#exitNodeSelect", (e) => e.value),
+        before,
+        "the picker was rebuilt under the user's hands"
+      );
+
+      // Once they leave it, the deferred status is rendered.
+      await page.evaluate(() => document.getElementById("exitNodeSelect").blur());
+      assert.equal(await page.$eval("#exitNodeSelect", (e) => e.value), "fra.tail1234.ts.net");
+      await page.close();
+    });
+
+    test("does not rebuild the picker when nothing changed", async () => {
+      const { page } = await open(target, CONNECTED);
+      await page.$eval("#exitNodeSelect", (e) => (e.options[0].marker = "kept"));
+      await page.evaluate((m) => window.__push(m), CONNECTED);
+      assert.equal(
+        await page.$eval("#exitNodeSelect", (e) => e.options[0].marker),
+        "kept",
+        "an identical status replaced the picker's options"
+      );
+      await page.close();
+    });
+
     test("re-enables the picker once the exit node is known", async () => {
       const { page } = await open(target, CONNECTED);
       assert.equal(await page.$eval("#exitNodeSelect", (e) => e.disabled), false);
@@ -235,6 +271,48 @@ for (const target of TARGETS) {
         return pre.scrollWidth > pre.clientWidth + 1;
       });
       assert.equal(overflows, false, "the install command overflows its box instead of wrapping");
+      await page.close();
+    });
+
+    // The background reports a host that answered and then went away as
+    // reconnecting. That is not a missing install and not an error: the
+    // popup waits, with the toggle disabled, since there is nothing to toggle.
+    test("says it is reconnecting, without an install command", async () => {
+      const { page } = await open(target, { reconnecting: true, error: "Native host has exited." });
+      const text = (await page.textContent("#state")).trim();
+      assert.ok(text.includes("Reconnecting"), `got ${JSON.stringify(text)}`);
+      assert.ok(!text.includes("--install"), "asked for an install while reconnecting");
+      assert.equal(await page.$eval("#toggleSlider", (e) => e.disabled), true);
+      assert.equal(await page.isVisible("#settingsButton"), false);
+      await page.close();
+    });
+
+    test("re-enables the toggle once the backend is back", async () => {
+      const { page } = await open(target, { reconnecting: true });
+      await page.evaluate((m) => window.__push(m), CONNECTED);
+      assert.equal(await page.$eval("#toggleSlider", (e) => e.disabled), false);
+      assert.equal(await page.isVisible("#settingsButton"), true);
+      await page.close();
+    });
+
+    // "Native host has exited" and "not found" both leave the popup asking
+    // for an install, and the fix is different for each, so the browser's
+    // reason is shown under the command rather than lost to the console.
+    test("shows the browser's reason under the install command", async () => {
+      const { page } = await open(target, {
+        installCmd: "go run github.com/iazat/ts-browser-ext@latest --install=Fabc",
+        error: "Native host has exited.",
+      });
+      const text = await page.textContent("#state");
+      assert.ok(text.includes("--install=F"));
+      assert.ok(text.includes("Native host has exited."), `reason missing from ${JSON.stringify(text)}`);
+      await page.close();
+    });
+
+    test("the install command is shown as text, not markup", async () => {
+      const { page } = await open(target, { installCmd: "<img src=x onerror=alert(1)>" });
+      const imgs = await page.$$("#state img");
+      assert.equal(imgs.length, 0, "the install command was inserted as HTML");
       await page.close();
     });
 
