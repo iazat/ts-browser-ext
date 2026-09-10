@@ -206,6 +206,10 @@ support.
 - **Connect / disconnect:** the toggle in the popup.
 - **Exit node:** the dropdown in the popup, or on the management page.
 - **Management page:** the **Settings** button opens `http://100.100.100.100/`.
+  It is served through the extension's proxy, so it is only there while the
+  extension is switched on. With it off, the browser is on a direct
+  connection, and on a machine that also runs the Tailscale app that address
+  answers with the app's own page instead.
 - **Log out:** the **Log out** button on the management page.
 
 ## Uninstall the native backend
