@@ -278,6 +278,43 @@ func uninstall() error {
 	return nil
 }
 
+// replaceFile writes data to path by way of a temporary file and a rename.
+//
+// Writing over the file in place is what os.WriteFile does, and the file is
+// very likely a running program: the browser keeps the backend alive for as
+// long as the extension is loaded, and upgrading means running --install
+// under it. macOS kills a process whose executable is rewritten underneath
+// it, so every upgrade took the tailnet down mid-session, and the extension
+// logged a host that had "exited". A rename leaves the running process its
+// old inode; it goes on until the extension is reloaded, and the reload
+// starts the new build.
+func replaceFile(path string, data []byte, perm os.FileMode) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".ts-browser-ext-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return err
+	}
+	if err := tmp.Chmod(perm); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	return nil
+}
+
 func install(installArg string) error {
 	browserByte, extension := installArg[0:1], installArg[1:]
 	switch browserByte {
@@ -304,7 +341,7 @@ func install(installArg string) error {
 		return err
 	}
 	targetBin := filepath.Join(targetDir, "ts-browser-ext")
-	if err := os.WriteFile(targetBin, binary, 0755); err != nil {
+	if err := replaceFile(targetBin, binary, 0755); err != nil {
 		return err
 	}
 	log.SetFlags(0)

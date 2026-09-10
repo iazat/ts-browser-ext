@@ -439,3 +439,49 @@ func TestWatchDeadDoesNotHideState(t *testing.T) {
 		t.Errorf("with nothing else to say, the marker should show; got %q", got)
 	}
 }
+
+// The installed binary is very likely running under the browser when
+// --install is run again. Rewriting it in place kills that process on macOS;
+// a rename leaves it its old inode.
+func TestReplaceFileKeepsTheOldInode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "ts-browser-ext")
+	if err := os.WriteFile(path, []byte("old"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(path) // stands in for the running process
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	if err := replaceFile(path, []byte("new build"), 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	stillOld, err := io.ReadAll(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(stillOld) != "old" {
+		t.Fatalf("the open file now reads %q; it was rewritten in place", stillOld)
+	}
+	now, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(now) != "new build" {
+		t.Fatalf("path reads %q, want the new build", now)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm()&0100 == 0 {
+		t.Fatal("the new file is not executable")
+	}
+	leftovers, _ := filepath.Glob(filepath.Join(dir, ".ts-browser-ext-*"))
+	if len(leftovers) != 0 {
+		t.Fatalf("temporary files left behind: %v", leftovers)
+	}
+}
