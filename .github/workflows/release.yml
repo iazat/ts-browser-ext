@@ -3,6 +3,15 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # A release can also be cut from the Actions tab or the API, for the
+  # cases where pushing a tag is not possible from where the work was done.
+  # The workflow then creates the tag itself, on the commit it checked out.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, without the v (must match manifest.json)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -24,6 +33,31 @@ jobs:
           node-version: 22
           cache: npm
 
+      # Settle the tag first. On a tag push it is the ref; on a manual run it
+      # is v<version>, checked against the manifests so a typo cannot publish
+      # a release whose zips claim another version.
+      - name: Resolve the tag
+        id: tag
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            version="${INPUT_VERSION#v}"
+            for m in manifest.json firefox/manifest.json; do
+              have=$(node -p "require('./$m').version")
+              if [ "$have" != "$version" ]; then
+                echo "$m says $have, but the release asked for $version" >&2
+                exit 1
+              fi
+            done
+            tag="v$version"
+          else
+            tag="${GITHUB_REF_NAME}"
+            version="${tag#v}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
       # Tags can be pushed at any commit, so re-run the checks here rather
       # than trusting that this one went through a pull request.
       - name: Verify
@@ -36,12 +70,30 @@ jobs:
           npm test
 
       - name: Package extensions
-        run: script/package.sh "${GITHUB_REF_NAME#v}"
+        run: script/package.sh "${{ steps.tag.outputs.version }}"
+
+      # On a manual run the tag does not exist yet. Create it on the commit
+      # that was just verified, so the release points at exactly what was
+      # tested. A tag that already exists is left alone: it may be the one
+      # that triggered a push run of this same workflow.
+      - name: Create the tag
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists; leaving it."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "$TAG"
+          git push origin "refs/tags/$TAG"
 
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
           notes="docs/release-notes/$TAG.md"
           if gh release view "$TAG" >/dev/null 2>&1; then

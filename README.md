@@ -65,6 +65,21 @@ Most of these predate the fork:
   the backend (up to 20 s) rather than failing on the spot, and CONNECT dials
   have a deadline (30 s) so an exit node that has gone quiet cannot leave a
   tab spinning indefinitely.
+- **Nothing brought the extension back after the machine slept.** Sleep
+  discards the service worker and the native host with it, and a timer set
+  by the worker dies too. The retry is now also held by the browser: a
+  one-minute alarm and the idle state flipping back to active both reconnect
+  a dead port, and so does opening the popup. Both manifests gained the
+  `alarms` and `idle` permissions, so reloading the extension is part of the
+  upgrade.
+- **A restart switched the tailnet back on, and forgot the exit node.** The
+  backend now remembers both the toggle and the exit node beside its state
+  and restores them right after start; the extension routes the browser on
+  the backend's first status rather than on sight, so off stays off. A
+  toggle flipped while the backend is away is delivered to the one that
+  arrives.
+- **The popup spent a restart blank.** It paints the last known status from
+  storage at once, under a spinner, until the background confirms it.
 - **The exit node reset to None on every restart.** tsnet starts the backend
   with a fresh set of preferences, and Tailscale takes that as the whole set,
   so every browser start and every reload of the extension silently dropped
@@ -191,6 +206,10 @@ support.
 - **Connect / disconnect:** the toggle in the popup.
 - **Exit node:** the dropdown in the popup, or on the management page.
 - **Management page:** the **Settings** button opens `http://100.100.100.100/`.
+  It is served through the extension's proxy, so it is only there while the
+  extension is switched on. With it off, the browser is on a direct
+  connection, and on a machine that also runs the Tailscale app that address
+  answers with the app's own page instead.
 - **Log out:** the **Log out** button on the management page.
 
 ## Uninstall the native backend
@@ -268,6 +287,11 @@ Cutting a release:
 1. Bump `version` in `manifest.json` and `firefox/manifest.json`.
 2. Add `docs/release-notes/vX.Y.Z.md`.
 3. Merge, then `git tag vX.Y.Z && git push origin vX.Y.Z`.
+
+Or, without pushing a tag: run the Release workflow by hand from the Actions
+tab (or `gh workflow run release.yml -f version=X.Y.Z`). It checks the version
+against both manifests, runs the same checks, creates the tag on the commit it
+verified, and publishes.
 
 To build the packages yourself:
 

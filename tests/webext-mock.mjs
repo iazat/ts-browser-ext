@@ -21,8 +21,17 @@ function respond(cb, value) {
 // `flavor` picks which global the script expects: "chrome" or "browser".
 // `extraGlobals` adds to the sandbox, so a test can hand the script an
 // environment that lies about which browser it is running in.
-export function loadBackground(file, flavor, extraGlobals = {}) {
+// `opts` (a plain object; a legacy caller may pass extra globals directly)
+// accepts:
+//   globals          — added to the sandbox, e.g. to lie about the browser
+//   storage          — seeds storage.local instead of the default profile id
+//   storageFailures  — that many reads answer nothing before any work
+export function loadBackground(file, flavor, opts = {}) {
+  const extraGlobals = opts.globals || (opts.storage || opts.storageFailures ? {} : opts);
   const calls = {
+    storage: opts.storage ? { ...opts.storage } : { profileId: "test-profile-id" },
+    storageFailures: opts.storageFailures || 0,
+    alarmsCreated: [], // alarms the script asked the browser to keep
     proxyListeners: [], // handlers currently registered on proxy.onRequest
     removeMisses: 0, //    removeListener calls that matched no handler
     proxyModes: [], //     modes passed to proxy.settings.set, in order
@@ -98,9 +107,28 @@ export function loadBackground(file, flavor, extraGlobals = {}) {
     },
     storage: {
       local: {
-        get: (key, cb) => respond(cb, { profileId: "test-profile-id" }),
-        set: (items, cb) => respond(cb, undefined),
+        get: (keys, cb) => {
+          if (calls.storageFailures-- > 0) return respond(cb, undefined);
+          const wanted = typeof keys === "string" ? [keys] : keys;
+          const out = {};
+          for (const k of wanted) if (k in calls.storage) out[k] = calls.storage[k];
+          return respond(cb, out);
+        },
+        set: (items, cb) => {
+          Object.assign(calls.storage, items);
+          return respond(cb, undefined);
+        },
       },
+    },
+    alarms: {
+      create: (name, info) => {
+        calls.alarmsCreated.push({ name, ...info });
+        return flavor === "chrome" ? Promise.resolve() : undefined;
+      },
+      onAlarm: { addListener: (f) => (calls.onAlarm = f) },
+    },
+    idle: {
+      onStateChanged: { addListener: (f) => (calls.onIdle = f) },
     },
     // Firefox-only: the popup warns when private browsing access is missing.
     extension: { isAllowedIncognitoAccess: () => Promise.resolve(true) },

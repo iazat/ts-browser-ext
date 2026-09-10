@@ -338,3 +338,104 @@ func TestSavedExitNodeRejectsGarbage(t *testing.T) {
 		t.Fatal("a corrupt file was read as a valid choice")
 	}
 }
+
+// tsnet starts the backend with WantRunning set, so a profile switched off
+// came back on at every restart and the extension routed the browser through
+// it. The switch is remembered like the exit node.
+func TestSavedWantRunningRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), savedWantRunningFile)
+
+	want, saved, err := readSavedWantRunning(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !want || saved {
+		t.Fatalf("missing file read as want=%v saved=%v; the default is on and unsaved", want, saved)
+	}
+
+	if err := writeSavedWantRunning(path, false); err != nil {
+		t.Fatal(err)
+	}
+	want, saved, err = readSavedWantRunning(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want || !saved {
+		t.Fatalf("got want=%v saved=%v after saving off", want, saved)
+	}
+
+	if err := writeSavedWantRunning(path, true); err != nil {
+		t.Fatal(err)
+	}
+	want, _, err = readSavedWantRunning(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !want {
+		t.Fatal("saving on was read back as off")
+	}
+}
+
+// A status that repeats the last one is not sent to the extension, unless it
+// answers something. The bus watcher's notifications mostly say nothing new.
+func TestEmitStatusDropsRepeats(t *testing.T) {
+	var out lockedBuffer
+	h := quietHost(strings.NewReader(""), &out)
+
+	h.emitStatus(false)
+	h.emitStatus(false)
+	h.emitStatus(false)
+	if n := len(decodeFrames(t, out.buf.Bytes())); n != 1 {
+		t.Fatalf("%d statuses sent for three identical updates, want 1", n)
+	}
+
+	h.sendStatus() // an answer, sent even though nothing changed
+	if n := len(decodeFrames(t, out.buf.Bytes())); n != 2 {
+		t.Fatalf("%d statuses after an explicit request, want 2", n)
+	}
+
+	h.mu.Lock()
+	h.lastState = ipn.Stopped
+	h.mu.Unlock()
+	h.emitStatus(false) // a change, sent
+	frames := decodeFrames(t, out.buf.Bytes())
+	if n := len(frames); n != 3 {
+		t.Fatalf("%d statuses after a state change, want 3", n)
+	}
+	if got := frames[2].Status.Error; got != "State: Stopped" {
+		t.Fatalf("last status error = %q, want State: Stopped", got)
+	}
+}
+
+// The dead-watch marker must not overwrite what the extension reads to
+// decide where traffic goes.
+func TestWatchDeadDoesNotHideState(t *testing.T) {
+	var out lockedBuffer
+	h := quietHost(strings.NewReader(""), &out)
+	h.mu.Lock()
+	h.lastState = ipn.Stopped
+	h.watchDead = true
+	h.mu.Unlock()
+	h.sendStatus()
+
+	h.mu.Lock()
+	h.lastState = ipn.NeedsLogin
+	h.mu.Unlock()
+	h.sendStatus()
+
+	h.mu.Lock()
+	h.lastState = ipn.Running
+	h.mu.Unlock()
+	h.sendStatus()
+
+	frames := decodeFrames(t, out.buf.Bytes())
+	if got := frames[0].Status.Error; got != "State: Stopped" {
+		t.Errorf("stopped profile reported %q; the extension routes on this string", got)
+	}
+	if !frames[1].Status.NeedsLogin || frames[1].Status.Error != "" {
+		t.Errorf("needs-login was hidden: %+v", frames[1].Status)
+	}
+	if got := frames[2].Status.Error; got != "WatchIPNBus stopped" {
+		t.Errorf("with nothing else to say, the marker should show; got %q", got)
+	}
+}
