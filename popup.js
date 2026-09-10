@@ -137,11 +137,6 @@ document.addEventListener("DOMContentLoaded", () => {
       if (state === "Stopped") {
         stateDisplay.textContent = "Disconnected";
         isConnected = false;
-        // The management page is served through the proxy, and the browser
-        // is on a direct connection now. On a machine with the Tailscale app
-        // installed, 100.100.100.100 then answers with that app's own page,
-        // which looks like ours and is not.
-        settingsButton.hidden = true;
         updateSliderState();
         renderExitNodes(status);
         return;
@@ -188,7 +183,6 @@ document.addEventListener("DOMContentLoaded", () => {
     if (typeof status === "string" && status === "Disconnected") {
       stateDisplay.textContent = "Disconnected";
       isConnected = false;
-      settingsButton.hidden = true;
       updateSliderState();
       return;
     }

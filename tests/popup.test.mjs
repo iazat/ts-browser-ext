@@ -385,16 +385,6 @@ for (const target of TARGETS) {
       await page.close();
     });
 
-    // With the extension off the browser is direct, and 100.100.100.100 is
-    // whatever the machine's own Tailscale answers there — not our page.
-    test("hides the settings button while disconnected", async () => {
-      const { page } = await open(target, { status: { error: "State: Stopped" } });
-      assert.equal(await page.isVisible("#settingsButton"), false);
-      await page.evaluate((m) => window.__push(m), CONNECTED);
-      assert.equal(await page.isVisible("#settingsButton"), true, "the button did not come back with the connection");
-      await page.close();
-    });
-
     test("the toggle reflects connection state", async () => {
       const on = await open(target, CONNECTED);
       const onClass = await on.page.getAttribute(".slider", "class");
