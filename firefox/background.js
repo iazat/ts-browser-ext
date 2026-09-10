@@ -452,11 +452,14 @@ function connectToNativeHost() {
     // not disableProxy(): that is the user's "off", and it is remembered.
     wasProxied = proxyEnabled;
     stopBrowserProxy();
+    // A host going away is routine — the replacement is a second away — and
+    // the browser files every console.error under the extension's errors,
+    // where a reconnect that worked reads as a fault.
     if (error) {
-      console.error("Connection failed:", error.message);
+      console.warn("Connection failed:", error.message);
       portError = error.message;
     } else {
-      console.error("Disconnected from native host");
+      console.warn("Disconnected from native host");
       portError = null;
     }
     sendPopupStatus();
