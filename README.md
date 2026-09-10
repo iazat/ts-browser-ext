@@ -284,6 +284,11 @@ Cutting a release:
 2. Add `docs/release-notes/vX.Y.Z.md`.
 3. Merge, then `git tag vX.Y.Z && git push origin vX.Y.Z`.
 
+Or, without pushing a tag: run the Release workflow by hand from the Actions
+tab (or `gh workflow run release.yml -f version=X.Y.Z`). It checks the version
+against both manifests, runs the same checks, creates the tag on the commit it
+verified, and publishes.
+
 To build the packages yourself:
 
 ```sh
