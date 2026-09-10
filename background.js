@@ -231,7 +231,16 @@ function sendPopupStatus() {
     // popup opening is often what started this worker. Only once reconnects
     // keep failing is it presumed gone, and the install command shown, with
     // the browser's reason next to it.
-    if ((everConnected || hostSeen || profileReadPending) && failedConnects <= installGiveUpAfter) {
+    // And while the very first attempt is still in flight — the port is
+    // open and nothing has failed yet — the honest word is "connecting",
+    // not "install": a host takes a moment to answer, and a popup opened
+    // right after a reload used to catch that moment and print the install
+    // command over a backend that was about to speak.
+    const firstAttemptPending = !nmPortClosed && failedConnects === 0;
+    if (
+      (everConnected || hostSeen || profileReadPending || firstAttemptPending) &&
+      failedConnects <= installGiveUpAfter
+    ) {
       sendToPopup({ reconnecting: true, error: portError });
       return;
     }

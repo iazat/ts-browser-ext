@@ -209,12 +209,24 @@ for (const target of TARGETS) {
       }
     });
 
+    // The first connect is still in flight when the popup opens right after
+    // a reload. That is not a missing install; the host answers a moment
+    // later. Only a failed attempt earns the install command.
+    test("says connecting, not install, while the first attempt is pending", async () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      await new Promise((r) => setImmediate(r));
+      connectPopup(calls);
+      assert.ok(calls.toPopup.some((m) => m.reconnecting), "the popup was not told to wait");
+      assert.ok(!calls.toPopup.some((m) => m.installCmd), "asked for an install before the first attempt had even failed");
+    });
+
     test("shows the install prompt with its own browser byte", async () => {
       const { calls } = loadBackground(target.file, target.flavor);
-      // No native host has answered yet, so the port is still considered dead.
-      // Until the profile read settles that reads as a reconnect, not an
-      // install; let it settle.
+      // The first attempt failed: no host answered, the browser closed the
+      // port. Until the profile read settles that reads as a reconnect, not
+      // an install; let it settle.
       await new Promise((r) => setImmediate(r));
+      calls.onNativeDisconnect();
       connectPopup(calls);
 
       const prompt = calls.toPopup.find((m) => m.installCmd);
@@ -244,6 +256,7 @@ for (const target of TARGETS) {
         globals: { [otherGlobal]: {}, navigator: { userAgent: otherAgent } },
       });
       await new Promise((r) => setImmediate(r));
+      calls.onNativeDisconnect();
       connectPopup(calls);
 
       const { installCmd } = calls.toPopup.find((m) => m.installCmd);
@@ -618,6 +631,7 @@ for (const target of TARGETS) {
     test("the install prompt installs this fork, not upstream", async () => {
       const { calls } = loadBackground(target.file, target.flavor);
       await new Promise((r) => setImmediate(r));
+      calls.onNativeDisconnect();
       connectPopup(calls);
 
       const { installCmd } = calls.toPopup.find((m) => m.installCmd);
