@@ -109,26 +109,20 @@ extension's own ID:
 	h := newHost(os.Stdin, os.Stdout)
 
 	// Running under the browser, stdout is the protocol and stderr goes
-	// nowhere anyone looks. Log to a file beside the state, always; and also
-	// to a local syslog when one is listening, the original debugging setup.
-	// The file used to be skipped when syslog answered, and anything that
-	// happens to listen on that port — it is a popular one — silently took
-	// the log with it.
-	var sinks []io.Writer
-	logPath := "(none)"
+	// nowhere anyone looks. Log to a file beside the state.
+	//
+	// This used to also dial a syslog on localhost:5555, upstream's debugging
+	// setup, and write every line there too. Anything that happens to listen
+	// on that port — it is a popular one — received the backend's logs,
+	// tailnet names and all; and a listener that accepted but did not read
+	// stalled every write, and with it the whole backend: the first status
+	// never reached the extension and the popup sat on "Connecting…".
 	if w, path, err := openLogFile(); err == nil {
-		sinks = append(sinks, w)
-		logPath = path
+		log.SetOutput(w)
+		log.Printf("ts-browser-ext pid %d logging to %s", os.Getpid(), path)
 	} else {
 		log.Printf("log file: %v", err)
 	}
-	if w, err := dialDebugSyslog(); err == nil {
-		sinks = append(sinks, w)
-	}
-	if len(sinks) > 0 {
-		log.SetOutput(io.MultiWriter(sinks...))
-	}
-	log.Printf("ts-browser-ext pid %d logging to %s", os.Getpid(), logPath)
 
 	ln := h.getProxyListener()
 	port := ln.Addr().(*net.TCPAddr).Port
