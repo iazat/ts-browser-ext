@@ -660,6 +660,13 @@ loadProfile();
 // Listener for messages from the popup
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   console.log("bg: Received message:", message);
+  if (message.command === "refreshStatus") {
+    // The popup asking again, while it waits for the exit node tunnel.
+    if (nmPort && !deadPort) {
+      nmPort.postMessage({ cmd: "get-status" });
+    }
+    return;
+  }
   if (message.command === "setExitNode") {
     if (nmPort && !deadPort) {
       nmPort.postMessage({ cmd: "set-exit-node", exitNode: message.exitNode });

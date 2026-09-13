@@ -223,6 +223,54 @@ for (const target of TARGETS) {
       await page.close();
     });
 
+    // A chosen exit node with no WireGuard handshake yet is why pages spin
+    // after a restart or a wake. The popup says so under the picker, and
+    // keeps asking for a fresh status until the tunnel is up.
+    test("says the tunnel to the exit node is still coming up", async () => {
+      const { page } = await open(target, {
+        status: { ...CONNECTED.status, exitNodeLink: { online: true, up: false, relay: "ams" } },
+      });
+      const hint = (await page.textContent("#exitNodeLink")).trim();
+      assert.ok(hint.includes("coming up"), `got ${JSON.stringify(hint)}`);
+      assert.ok(hint.includes("ams"));
+      assert.ok((await page.getAttribute("#exitNodeLink", "class")).includes("wait"));
+
+      await page.waitForTimeout(2300);
+      const sent = await page.evaluate(() => window.__sent);
+      assert.ok(sent.some((m) => m.command === "refreshStatus"), "the popup did not ask for a fresh status while waiting");
+      await page.close();
+    });
+
+    test("says how the tunnel runs once it is up", async () => {
+      const relayed = await open(target, {
+        status: { ...CONNECTED.status, exitNodeLink: { online: true, up: true, relay: "ams", handshakeAgeSeconds: 12 } },
+      });
+      assert.ok((await relayed.page.textContent("#exitNodeLink")).includes("via relay ams"));
+      assert.ok(!(await relayed.page.getAttribute("#exitNodeLink", "class")).includes("wait"));
+      await relayed.page.close();
+
+      const direct = await open(target, {
+        status: { ...CONNECTED.status, exitNodeLink: { online: true, up: true, direct: true, relay: "ams" } },
+      });
+      assert.ok((await direct.page.textContent("#exitNodeLink")).includes("direct"));
+      await direct.page.close();
+    });
+
+    test("says when the exit node itself is offline", async () => {
+      const { page } = await open(target, {
+        status: { ...CONNECTED.status, exitNodeLink: { online: false, up: false } },
+      });
+      assert.ok((await page.textContent("#exitNodeLink")).includes("offline"));
+      assert.ok((await page.getAttribute("#exitNodeLink", "class")).includes("bad"));
+      await page.close();
+    });
+
+    test("hides the tunnel line when no exit node is selected", async () => {
+      const { page } = await open(target, { status: { ...CONNECTED.status, exitNode: "" } });
+      assert.equal(await page.isVisible("#exitNodeLink"), false);
+      await page.close();
+    });
+
     test("re-enables the picker once the exit node is known", async () => {
       const { page } = await open(target, CONNECTED);
       assert.equal(await page.$eval("#exitNodeSelect", (e) => e.disabled), false);

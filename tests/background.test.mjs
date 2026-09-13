@@ -89,6 +89,14 @@ for (const target of TARGETS) {
       );
     });
 
+    test("asks the host for a fresh status when the popup wants one", async () => {
+      const { calls } = loadBackground(target.file, target.flavor);
+      bringUp(calls);
+      calls.toNativeHost.length = 0;
+      await sendCommand(calls, { command: "refreshStatus" });
+      assert.ok(calls.toNativeHost.some((m) => m.cmd === "get-status"));
+    });
+
     test("forwards the chosen exit node to the native host", async () => {
       const { calls } = loadBackground(target.file, target.flavor);
       bringUp(calls);
