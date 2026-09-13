@@ -1350,7 +1350,7 @@ func (h *host) emitStatus(force bool) {
 				})
 				if selected {
 					st.ExitNode = name
-					st.ExitNodeLink = describeExitNodeLink(ps, time.Now())
+					st.ExitNodeLink = describeExitNodeLink(ps, time.Now()).forStatus()
 				}
 			}
 			sort.Slice(st.ExitNodes, func(i, j int) bool {
@@ -1496,6 +1496,21 @@ func describeExitNodeLink(ps *ipnstate.PeerStatus, now time.Time) *exitNodeLink 
 		l.HandshakeAgeSeconds = now.Sub(ps.LastHandshake).Seconds()
 	}
 	return l
+}
+
+// forStatus is the link as the extension is told it: without the handshake
+// age. The age is a clock reading, different every time it is taken, and a
+// status carrying it is never identical to the one before, so every IPN bus
+// notification got through the repeat check and the browser was back to a
+// status, an icon redraw and a storage write every few seconds. The popup
+// only reads the four flags; the age stays on the management page.
+func (l *exitNodeLink) forStatus() *exitNodeLink {
+	if l == nil {
+		return nil
+	}
+	c := *l
+	c.HandshakeAgeSeconds = 0
+	return &c
 }
 
 type exitNodeInfo struct {

@@ -548,3 +548,32 @@ func TestDescribeDial(t *testing.T) {
 		})
 	}
 }
+
+// The status must not carry a clock reading: a value that changes on every
+// read makes every status differ from the last and defeats the repeat check.
+func TestStatusLinkCarriesNoHandshakeAge(t *testing.T) {
+	now := time.Now()
+	ps := &ipnstate.PeerStatus{Online: true, LastHandshake: now.Add(-30 * time.Second), CurAddr: "1.2.3.4:41641", Relay: "nyc"}
+	full := describeExitNodeLink(ps, now)
+	if full.HandshakeAgeSeconds < 29 || full.HandshakeAgeSeconds > 31 {
+		t.Fatalf("management page age = %v, want about 30", full.HandshakeAgeSeconds)
+	}
+	a, _ := json.Marshal(full.forStatus())
+	b, _ := json.Marshal(describeExitNodeLink(ps, now.Add(15*time.Second)).forStatus())
+	if !bytes.Equal(a, b) {
+		t.Fatalf("status link changed with the clock alone:\n%s\n%s", a, b)
+	}
+	if strings.Contains(string(a), "handshakeAgeSeconds") {
+		t.Fatalf("status link carries the age: %s", a)
+	}
+	got := full.forStatus()
+	if !got.Online || !got.Up || !got.Direct || got.Relay != "nyc" {
+		t.Fatalf("status link lost a flag: %+v", got)
+	}
+	if full.HandshakeAgeSeconds == 0 {
+		t.Fatal("forStatus changed the original")
+	}
+	if (*exitNodeLink)(nil).forStatus() != nil {
+		t.Fatal("nil link should stay nil")
+	}
+}
