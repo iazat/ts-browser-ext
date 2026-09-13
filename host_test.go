@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"tailscale.com/ipn"
+	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 )
 
@@ -483,5 +484,45 @@ func TestReplaceFileKeepsTheOldInode(t *testing.T) {
 	leftovers, _ := filepath.Glob(filepath.Join(dir, ".ts-browser-ext-*"))
 	if len(leftovers) != 0 {
 		t.Fatalf("temporary files left behind: %v", leftovers)
+	}
+}
+
+// The popup tells the tunnel to the exit node apart from a page that is
+// merely slow by this. A fresh process has no handshake until the first one
+// lands, and that is the state in which pages spin.
+func TestDescribeExitNodeLink(t *testing.T) {
+	now := time.Date(2026, 9, 13, 19, 50, 0, 0, time.UTC)
+	for _, tt := range []struct {
+		name string
+		peer ipnstate.PeerStatus
+		want exitNodeLink
+	}{
+		{
+			name: "no handshake yet",
+			peer: ipnstate.PeerStatus{Online: true, Relay: "ams"},
+			want: exitNodeLink{Online: true, Relay: "ams"},
+		},
+		{
+			name: "up through a relay",
+			peer: ipnstate.PeerStatus{Online: true, Relay: "ams", LastHandshake: now.Add(-30 * time.Second)},
+			want: exitNodeLink{Online: true, Up: true, Relay: "ams", HandshakeAgeSeconds: 30},
+		},
+		{
+			name: "up and direct",
+			peer: ipnstate.PeerStatus{Online: true, CurAddr: "203.0.113.5:41641", Relay: "ams", LastHandshake: now.Add(-2 * time.Second)},
+			want: exitNodeLink{Online: true, Up: true, Direct: true, Relay: "ams", HandshakeAgeSeconds: 2},
+		},
+		{
+			name: "offline",
+			peer: ipnstate.PeerStatus{Online: false},
+			want: exitNodeLink{},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := describeExitNodeLink(&tt.peer, now)
+			if *got != tt.want {
+				t.Errorf("got %+v, want %+v", *got, tt.want)
+			}
+		})
 	}
 }

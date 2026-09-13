@@ -653,7 +653,40 @@ func (h *host) setExitNode(ctx context.Context, lc *local.Client, name string) e
 	if err := writeSavedExitNode(h.savedExitNodePath(), prefs); err != nil {
 		h.logf("remembering exit node: %v", err)
 	}
+	go h.warmExitNode(lc)
 	return nil
+}
+
+// warmExitNode sends a disco ping to the selected exit node, so that path
+// discovery and the WireGuard handshake start now rather than with the first
+// page the browser tries to load through it. It is best effort: a failure
+// only means the first page load does the warming instead. The status loop
+// is nudged afterwards so the popup sees the handshake as soon as it lands.
+func (h *host) warmExitNode(lc *local.Client) {
+	ctx, cancel := context.WithTimeout(context.Background(), localAPITimeout)
+	defer cancel()
+	st, err := lc.Status(ctx)
+	if err != nil {
+		return
+	}
+	prefID, prefIP, _ := configuredExitNode(lc, h.logf)
+	for _, ps := range st.Peer {
+		if !isConfiguredExitNode(ps, prefID, prefIP) || len(ps.TailscaleIPs) == 0 {
+			continue
+		}
+		ip := ps.TailscaleIPs[0]
+		res, err := lc.Ping(ctx, ip, tailcfg.PingDisco)
+		switch {
+		case err != nil:
+			h.logf("warming exit node %v: %v", ip, err)
+		case res.Err != "":
+			h.logf("warming exit node %v: %s", ip, res.Err)
+		default:
+			h.logf("exit node %v answered a disco ping in %.0fms via %q (direct endpoint %q)", ip, res.LatencySeconds*1000, res.DERPRegionCode, res.Endpoint)
+		}
+		h.scheduleStatus()
+		return
+	}
 }
 
 // savedExitNodeFile is where the chosen exit node is kept between processes,
@@ -744,6 +777,7 @@ func (h *host) restoreExitNode(lc *local.Client) error {
 	if _, err := lc.EditPrefs(ctx, s.maskedPrefs()); err != nil {
 		return fmt.Errorf("EditPrefs: %w", err)
 	}
+	go h.warmExitNode(lc)
 	return nil
 }
 
@@ -1315,6 +1349,7 @@ func (h *host) emitStatus(force bool) {
 				})
 				if selected {
 					st.ExitNode = name
+					st.ExitNodeLink = describeExitNodeLink(ps, time.Now())
 				}
 			}
 			sort.Slice(st.ExitNodes, func(i, j int) bool {
@@ -1422,6 +1457,44 @@ type status struct {
 	// being empty. The picker must not say None while this is set: see
 	// [exitNodeResolving].
 	ExitNodeResolving bool `json:"exitNodeResolving,omitempty"`
+
+	// ExitNodeLink describes the tunnel to the selected exit node, when one
+	// is selected and in the peer list. It is what lets the popup say that
+	// the node is chosen but not yet reachable, instead of leaving pages to
+	// spin: a fresh process has no WireGuard session with the node until the
+	// first handshake, and finding a path — direct, or through a relay — can
+	// take a while after a restart or a wake.
+	ExitNodeLink *exitNodeLink `json:"exitNodeLink,omitempty"`
+}
+
+type exitNodeLink struct {
+	// Online is whether the tailnet reports the node as connected to the
+	// control plane at all.
+	Online bool `json:"online"`
+	// Up is whether a WireGuard handshake with the node has completed in
+	// this process's life. Until it has, nothing sent to the node comes back.
+	Up bool `json:"up"`
+	// Direct is whether traffic goes straight to the node; when false and
+	// Up, it goes through the relay named in Relay.
+	Direct bool `json:"direct"`
+	// Relay is the DERP region code in use, e.g. "ams", when known.
+	Relay string `json:"relay,omitempty"`
+	// HandshakeAgeSeconds is how long ago the last handshake was, when Up.
+	HandshakeAgeSeconds float64 `json:"handshakeAgeSeconds,omitempty"`
+}
+
+// describeExitNodeLink reads the tunnel state off a peer's status.
+func describeExitNodeLink(ps *ipnstate.PeerStatus, now time.Time) *exitNodeLink {
+	l := &exitNodeLink{
+		Online: ps.Online,
+		Up:     !ps.LastHandshake.IsZero(),
+		Direct: ps.CurAddr != "",
+		Relay:  ps.Relay,
+	}
+	if l.Up {
+		l.HandshakeAgeSeconds = now.Sub(ps.LastHandshake).Seconds()
+	}
+	return l
 }
 
 type exitNodeInfo struct {
@@ -1486,6 +1559,10 @@ type webData struct {
 	SavedExitNode webExitNodePrefs `json:"savedExitNode"`
 	Pid           int              `json:"pid"`
 	LogFile       string           `json:"logFile"`
+
+	// ExitNodeLink is the tunnel to the selected exit node; see the status
+	// field of the same name.
+	ExitNodeLink *exitNodeLink `json:"exitNodeLink,omitempty"`
 }
 
 type webExitNodePrefs struct {
@@ -1567,6 +1644,7 @@ func (h *host) serveInternalData(w http.ResponseWriter, r *http.Request) {
 	for _, ps := range st.Peer {
 		if isConfiguredExitNode(ps, prefID, prefIP) {
 			d.ExitNode = machineName(ps.DNSName, ps.HostName)
+			d.ExitNodeLink = describeExitNodeLink(ps, time.Now())
 		}
 		d.Peers = append(d.Peers, webPeer{
 			Name:           machineName(ps.DNSName, ps.HostName),
@@ -1769,6 +1847,9 @@ const internalPageHTML = `<!doctype html>
     background: #eef2fb; border-radius: 5px; padding: 1px 6px; margin-left: 8px;
     vertical-align: middle; }
   #err { color: #c0392b; font-size: 13px; margin-top: 10px; }
+  .hint { font-size: 13px; color: var(--muted); margin-top: 10px; }
+  .hint.wait { color: #b8791e; }
+  .hint.bad { color: #c0392b; }
   .credit { margin-top: 32px; padding-top: 16px; border-top: 1px solid var(--line);
     font-size: 12px; color: var(--muted); text-align: center; }
   .credit a { color: var(--blue); text-decoration: none; }
@@ -1803,6 +1884,7 @@ const internalPageHTML = `<!doctype html>
   <h2>Exit node</h2>
   <div class="card pad">
     <select id="exitNode"></select>
+    <div id="tunnel" class="hint"></div>
     <div id="err"></div>
   </div>
 
@@ -1832,6 +1914,7 @@ async function load() {
     row("Backend", esc(d.version));
 
   renderExitNodePicker(d);
+  renderTunnel(d);
 
   const rows = d.peers.map(function(p) {
     return '<tr><td class="name">' + '<span class="dot ' + (p.online ? "on" : "off") + '"></span>' + esc(p.name) +
@@ -1843,6 +1926,22 @@ async function load() {
 }
 
 function row(k, v) { return '<div class="row"><span class="k">' + k + '</span><span class="v">' + v + "</span></div>"; }
+
+// tunnelText says where the tunnel to the exit node stands. It is shared
+// with the popup in spirit, not in code: the two are separate files.
+function tunnelText(link) {
+  if (!link) return { text: "", cls: "" };
+  if (!link.online) return { text: "Exit node is offline", cls: "bad" };
+  if (!link.up) return { text: "Tunnel to the exit node is coming up\u2026" + (link.relay ? " (via relay " + link.relay + ")" : ""), cls: "wait" };
+  if (link.direct) return { text: "Tunnel up, direct connection", cls: "" };
+  return { text: "Tunnel up via relay " + (link.relay || "?"), cls: "" };
+}
+function renderTunnel(d) {
+  const el = document.getElementById("tunnel");
+  const t = tunnelText(d.exitNode ? d.exitNodeLink : null);
+  el.textContent = t.text;
+  el.className = "hint " + t.cls;
+}
 
 // The picker is rebuilt only when its contents change, and never while the
 // user is in it. This page refreshes every few seconds, and replacing the

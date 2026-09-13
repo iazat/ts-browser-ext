@@ -13,6 +13,48 @@ document.addEventListener("DOMContentLoaded", () => {
   const stateDisplay = document.getElementById("state");
   const exitNodeRow = document.getElementById("exitNodeRow");
   const exitNodeSelect = document.getElementById("exitNodeSelect");
+  const exitNodeLink = document.getElementById("exitNodeLink");
+
+  // tunnelText says where the tunnel to the exit node stands. A fresh
+  // backend has no WireGuard session with the node until the first
+  // handshake, and finding a path after a restart or a wake can take a
+  // while; pages loaded meanwhile just spin. This is the difference between
+  // that and a page that is simply slow.
+  function tunnelText(link) {
+    if (!link) return null;
+    if (!link.online) return { text: "Exit node is offline", cls: "bad" };
+    if (!link.up) {
+      return {
+        text: "Tunnel to the exit node is coming up…" + (link.relay ? ` (via relay ${link.relay})` : ""),
+        cls: "wait",
+      };
+    }
+    if (link.direct) return { text: "Tunnel up, direct connection", cls: "" };
+    return { text: `Tunnel up via relay ${link.relay || "?"}`, cls: "" };
+  }
+
+  // While the tunnel is not up, ask the background for a fresh status every
+  // couple of seconds, so the line above turns as soon as the handshake
+  // lands rather than when the popup is next opened.
+  let tunnelPoll = null;
+  function renderTunnel(status) {
+    const t = status.exitNode ? tunnelText(status.exitNodeLink) : null;
+    if (!t) {
+      exitNodeLink.hidden = true;
+      exitNodeLink.textContent = "";
+    } else {
+      exitNodeLink.hidden = false;
+      exitNodeLink.textContent = t.text;
+      exitNodeLink.className = "link-hint " + t.cls;
+    }
+    const waiting = !!t && t.cls === "wait";
+    if (waiting && tunnelPoll === null) {
+      tunnelPoll = setTimeout(() => {
+        tunnelPoll = null;
+        chrome.runtime.sendMessage({ command: "refreshStatus" });
+      }, 2000);
+    }
+  }
 
   // renderedExitNodes is a signature of what the picker currently shows, and
   // pendingExitNodes a status whose rendering was put off. The picker's
@@ -32,6 +74,7 @@ document.addEventListener("DOMContentLoaded", () => {
       return;
     }
     exitNodeRow.hidden = false;
+    renderTunnel(status);
     const selected = status.exitNode || "";
     const signature = JSON.stringify([
       !!status.exitNodeResolving,

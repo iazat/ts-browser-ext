@@ -236,6 +236,25 @@
         font-size: 14px;
       }
 
+      /* Where the tunnel to the chosen exit node stands: coming up, direct,
+         or through a relay. Amber while it is not there yet. */
+      .link-hint {
+        font-size: 12px;
+        color: #706e6c;
+      }
+
+      .link-hint[hidden] {
+        display: none;
+      }
+
+      .link-hint.wait {
+        color: #b8791e;
+      }
+
+      .link-hint.bad {
+        color: #c0392b;
+      }
+
       .exit-node select {
         padding: 8px;
         padding-right: 32px;
@@ -285,6 +304,7 @@
     <div id="exitNodeRow" class="exit-node" hidden>
       <label for="exitNodeSelect">Exit node</label>
       <select id="exitNodeSelect"></select>
+      <div id="exitNodeLink" class="link-hint" hidden></div>
     </div>
     <div class="controls">
       <button id="settingsButton" class="settings-button">Settings</button>
