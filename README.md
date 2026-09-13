@@ -184,6 +184,12 @@ Go sources, tests and CI config, which load harmlessly but are just noise.
    it registers **your local build** rather than the last release.
 5. Reload the extension, click the icon again, and select **Log in**.
 
+To update later, run the same `--install` command again and reload the
+extension. The install swaps the binary on disk without touching a backend
+that is already running, so until the reload the browser keeps talking to the
+old one; `pid` on `http://100.100.100.100/api/data` changes once the new one
+is up.
+
 ## Install (Firefox)
 
 Requires Firefox 109 or newer — the manifest is v3, which older builds do not
@@ -211,6 +217,15 @@ support.
   connection, and on a machine that also runs the Tailscale app that address
   answers with the app's own page instead.
 - **Log out:** the **Log out** button on the management page.
+- **When pages drag:** the backend log, at the path `logFile` on
+  `http://100.100.100.100/api/data` names, records every browser connection
+  that took more than two seconds to dial (`dial tcp/host:443 took 3.2s`) or
+  failed, and the answer to the disco ping sent when an exit node is chosen
+  (`answered a disco ping in 180ms via "nyc"`, with the direct endpoint if
+  there is one). A dial covers the name lookup and the TCP handshake, both
+  made through the exit node, so the two lines together say whether the
+  tunnel is relayed, how far away the exit node is, and which sites wait on
+  it. `exitNodeLink` on the same page shows the tunnel state the popup shows.
 
 ## Uninstall the native backend
 
