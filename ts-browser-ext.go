@@ -374,6 +374,7 @@ func install(installArg string) error {
 		return err
 	}
 	log.Printf("wrote registration to %v", targetJSON)
+	log.Printf("a backend that is already running keeps the old code: reload the extension so the browser starts the new one")
 
 	// Clear registrations from before the rename, so the browser cannot find
 	// two hosts and so nothing is left pointing at a binary we no longer own.
@@ -1773,13 +1774,40 @@ func (h *host) httpProxyHandler() http.Handler {
 // one on the HTTP path too.
 const proxyDialTimeout = 30 * time.Second
 
+// slowDialThreshold is how long a browser connection may take to dial before
+// the backend log says so. A dial covers the name lookup, which goes through
+// the exit node's resolvers when one is set, and the TCP handshake with the
+// destination, made from the exit node; each is a round trip through the
+// tunnel, so a slow tunnel shows up here first, one line per slow page,
+// before the user has anything more than a feeling that the browser drags.
+const slowDialThreshold = 2 * time.Second
+
 // dialWithTimeout is userDial under proxyDialTimeout. The context only
 // governs the dial: the connections tsnet hands back are not tied to it, so
 // cancelling it once the dial has returned does not close them.
 func (h *host) dialWithTimeout(ctx context.Context, netw, addr string) (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(ctx, proxyDialTimeout)
 	defer cancel()
-	return h.userDial(ctx, netw, addr)
+	start := time.Now()
+	c, err := h.userDial(ctx, netw, addr)
+	if line := describeDial(netw, addr, time.Since(start), err); line != "" {
+		h.logf("%s", line)
+	}
+	return c, err
+}
+
+// describeDial is the log line for a browser dial worth a line: one that
+// failed, or one that took longer than slowDialThreshold. It is empty for
+// the ordinary quick dial.
+func describeDial(netw, addr string, took time.Duration, err error) string {
+	shown := took.Round(10 * time.Millisecond)
+	switch {
+	case err != nil:
+		return fmt.Sprintf("dial %s/%s failed after %v: %v", netw, addr, shown, err)
+	case took >= slowDialThreshold:
+		return fmt.Sprintf("dial %s/%s took %v", netw, addr, shown)
+	}
+	return ""
 }
 
 // internalPageHTML is the management page served at http://100.100.100.100/.

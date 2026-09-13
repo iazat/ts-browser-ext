@@ -526,3 +526,25 @@ func TestDescribeExitNodeLink(t *testing.T) {
 		})
 	}
 }
+
+func TestDescribeDial(t *testing.T) {
+	tests := []struct {
+		name string
+		took time.Duration
+		err  error
+		want string
+	}{
+		{"quick", 120 * time.Millisecond, nil, ""},
+		{"just under", slowDialThreshold - time.Millisecond, nil, ""},
+		{"slow", 3250 * time.Millisecond, nil, "dial tcp/example.com:443 took 3.25s"},
+		{"failed", 30 * time.Second, errors.New("context deadline exceeded"), "dial tcp/example.com:443 failed after 30s: context deadline exceeded"},
+		{"failed fast", 5 * time.Millisecond, errors.New("not routing yet: the tailnet is Starting"), "dial tcp/example.com:443 failed after 10ms: not routing yet: the tailnet is Starting"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := describeDial("tcp", "example.com:443", tt.took, tt.err); got != tt.want {
+				t.Fatalf("describeDial(%v, %v) = %q, want %q", tt.took, tt.err, got, tt.want)
+			}
+		})
+	}
+}
