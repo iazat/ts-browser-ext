@@ -188,7 +188,7 @@ chrome.runtime.onConnect.addListener((port) => {
   popupPorts.add(port);
 
   console.log(
-    "Popup connected; worker up for " +
+    "Popup opened; worker up for " +
       Math.round((Date.now() - workerStarted) / 1000) +
       " s, host port " +
       (nmPort && !deadPort ? "open" : "closed")
@@ -199,7 +199,7 @@ chrome.runtime.onConnect.addListener((port) => {
   });
 
   port.onDisconnect.addListener(() => {
-    console.log("Popup disconnected");
+    console.log("Popup closed");
     popupPorts.delete(port);
   });
 
