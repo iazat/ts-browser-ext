@@ -3,8 +3,21 @@
   <head>
     <meta charset="UTF-8" />
     <title>Proxy Toggle</title>
-    <script src="popup.js"></script>
+    <!-- The script is deferred and the fonts preloaded so that the first
+         frame is not held up: until it lands the browser shows the panel as
+         an empty box of its own colour, and every millisecond of that reads
+         as the extension being slow. -->
+    <link rel="preload" href="fonts/inter-latin.woff2" as="font" type="font/woff2" crossorigin />
+    <script src="popup.js" defer></script>
     <style>
+      /* The root is painted, not just the body: the panel is a bubble the
+         browser draws in its own theme, and until the page paints, that
+         theme shows through. On a dark browser that is a dark square. */
+      html {
+        color-scheme: light;
+        background-color: #faf7f6;
+      }
+
       /* Inter is bundled rather than pulled from fonts.googleapis.com: the
          popup would otherwise tell Google every time someone opens it, and
          render in a fallback font whenever the machine is offline — which,

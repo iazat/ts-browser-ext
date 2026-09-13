@@ -15,6 +15,18 @@ document.addEventListener("DOMContentLoaded", () => {
   let answered = false;
   let gotStatus = false;
   const sinceOpened = () => Math.round(performance.now() - opened) + " ms";
+  console.log("panel script ran", Math.round(opened), "ms after navigation");
+  // The browser shows the panel as an empty box until the first frame; this
+  // says when that frame came, from the page's own clock.
+  try {
+    new PerformanceObserver((list) => {
+      for (const e of list.getEntries()) {
+        console.log(e.name, "at", Math.round(e.startTime), "ms after navigation");
+      }
+    }).observe({ type: "paint", buffered: true });
+  } catch (e) {
+    // Older engines have no paint timing; the other numbers still stand.
+  }
 
   const toggleSlider = document.getElementById("toggleSlider");
   const slider = document.querySelector(".slider");
