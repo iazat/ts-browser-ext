@@ -7,6 +7,15 @@ function browseToURL() {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+  // opened is when this panel started, so that the console can say how long
+  // the background took to answer. "The popup is slow" can be the panel
+  // itself, a background that had to be started, or a backend that had to
+  // be started with it; the number tells which.
+  const opened = performance.now();
+  let answered = false;
+  let gotStatus = false;
+  const sinceOpened = () => Math.round(performance.now() - opened) + " ms";
+
   const toggleSlider = document.getElementById("toggleSlider");
   const slider = document.querySelector(".slider");
   const settingsButton = document.getElementById("settingsButton");
@@ -250,6 +259,14 @@ document.addEventListener("DOMContentLoaded", () => {
 
   port.onMessage.addListener((msg) => {
     console.log("Received from background:", JSON.stringify(msg));
+    if (!answered) {
+      answered = true;
+      console.log("first answer from the background after", sinceOpened());
+    }
+    if (!gotStatus && msg.status && msg.status.running !== undefined) {
+      gotStatus = true;
+      console.log("first live status after", sinceOpened());
+    }
     painted = true;
 
     // firefox requires that extensions settings proxies have private browsing access

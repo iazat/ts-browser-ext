@@ -168,6 +168,13 @@ function syncProxyToBackend(status) {
 
 console.log("starting ts-browser-ext");
 
+// workerStarted is when this worker came up. The browser discards the
+// worker when it sees nothing to keep it for, and the backend dies with it;
+// a popup that opens right after is waiting for both. The console line on
+// popup connect says how old the worker is, which tells that wait from one
+// spent elsewhere.
+const workerStarted = Date.now();
+
 // Every popup that is currently open. It used to be a single port, so opening
 // the panel while popup.html was also open in a tab left the tab frozen on
 // whatever it had rendered first.
@@ -179,7 +186,12 @@ browser.runtime.onConnect.addListener((port) => {
   }
   popupPorts.add(port);
 
-  console.log("Popup connected");
+  console.log(
+    "Popup connected; worker up for " +
+      Math.round((Date.now() - workerStarted) / 1000) +
+      " s, host port " +
+      (nmPort && !deadPort ? "open" : "closed")
+  );
 
   port.onMessage.addListener((msg) => {
     console.log("Message from popup:", msg);
