@@ -128,10 +128,10 @@ local and trusted).
 | ------- | ------- | ----------------------------------------------- |
 | Chrome  | macOS   | **Works** — exercised before each release        |
 | Chrome  | Linux   | Should work; untested                            |
-| Chrome  | Windows | Backend builds, but cannot register itself       |
+| Chrome  | Windows | Registers itself; untested in a real browser     |
 | Firefox | macOS   | Passes its tests; not yet run in a real Firefox  |
 | Firefox | Linux   | Same, and the platform is untested too           |
-| Firefox | Windows | Backend builds, but cannot register itself       |
+| Firefox | Windows | Registers itself; untested in a real browser     |
 | Safari  | \*      | Not possible (no Native Messaging)               |
 
 This is still **experimental** and aimed at developers, not end users.
@@ -144,16 +144,25 @@ but no build of it has been loaded through `about:debugging` since that rework �
 and two of the bugs fixed in it were found by reading the code, not by the
 tests. Treat it as untried.
 
-**Windows.** The native binary compiles, but `--install` has no code path for
-it: registering a native messaging host on Windows means writing registry keys,
-and that is not implemented. Use macOS or Linux.
+**Windows.** `--install` copies the backend to
+`%LOCALAPPDATA%\tailscale-browser-ext\NativeMessagingHosts\ts-browser-ext.exe`,
+writes the manifest beside it, and points the browser at the manifest with a
+key under `HKEY_CURRENT_USER\Software\Google\Chrome\NativeMessagingHosts` or
+`HKEY_CURRENT_USER\Software\Mozilla\NativeMessagingHosts` — no admin rights
+needed. Windows will not overwrite a running program, so a reinstall renames
+the running backend to `ts-browser-ext.exe.old-…` and the next install deletes
+it. This path is built and unit-tested in CI but has not been run against a
+real browser yet. Until a release carries it, install from a clone with
+`go run . --install=…`: the `@latest` command in the popup fetches the last
+release, which still fails with `TODO: implement support for installing on
+"windows"`.
 
 ## Requirements
 
 - [Go](https://go.dev/dl/) (the version in [`go.mod`](go.mod) or newer). The
   native backend is always built on your own machine, including when you
   install the extension from a release.
-- Chrome or Firefox, on macOS or Linux.
+- Chrome or Firefox, on macOS, Linux or Windows.
 
 ## Getting the extension files
 

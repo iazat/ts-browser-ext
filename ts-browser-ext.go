@@ -241,8 +241,18 @@ func getTargetDir(browserByte string) (string, error) {
 		} else if browserByte == "F" {
 			dir = filepath.Join(home, "Library", "Application Support", "Mozilla", "NativeMessagingHosts")
 		}
+	case "windows":
+		// Windows browsers find native hosts through the registry, not a
+		// directory, so the manifests can live anywhere the registry values
+		// point at. %LOCALAPPDATA% is per user and not roamed: the binary is
+		// built for this machine and should not follow the profile around.
+		localDir, err := os.UserCacheDir()
+		if err != nil {
+			return "", err
+		}
+		dir = filepath.Join(localDir, "tailscale-browser-ext", "NativeMessagingHosts")
 	default:
-		return "", fmt.Errorf("TODO: implement support for installing on %q", runtime.GOOS)
+		return "", fmt.Errorf("installing on %q is not supported", runtime.GOOS)
 	}
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return "", err
@@ -256,13 +266,17 @@ func uninstall() error {
 		if err != nil {
 			return err
 		}
-		targetBin := filepath.Join(targetDir, "ts-browser-ext")
+		targetBin := filepath.Join(targetDir, hostBinaryName())
 		if err := os.Remove(targetBin); err != nil && !os.IsNotExist(err) {
 			return err
 		}
+		removeSetAside(targetBin)
 		// Both the current registration and anything an older version left.
 		names := append([]string{hostName(browserByte)}, legacyHostNames...)
 		for _, name := range names {
+			if _, err := unregisterHost(browserByte, name); err != nil {
+				return err
+			}
 			path := filepath.Join(targetDir, name+".json")
 			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 				return err
@@ -302,11 +316,78 @@ func replaceFile(path string, data []byte, perm os.FileMode) error {
 		os.Remove(tmpPath)
 		return err
 	}
+	if runtime.GOOS == "windows" {
+		// Windows will not rename over an executable that is running, but
+		// it will rename the running one out of the way. It keeps running
+		// from its new name until the extension is reloaded, and the next
+		// install deletes it.
+		removeSetAside(path)
+		aside := fmt.Sprintf("%s.old-%d", path, time.Now().UnixNano())
+		if err := os.Rename(path, aside); err != nil && !os.IsNotExist(err) {
+			os.Remove(tmpPath)
+			return err
+		}
+	}
 	if err := os.Rename(tmpPath, path); err != nil {
 		os.Remove(tmpPath)
 		return err
 	}
+	if runtime.GOOS == "windows" {
+		removeSetAside(path)
+	}
 	return nil
+}
+
+// removeSetAside deletes the binaries replaceFile moved out of the way on
+// Windows. One that is still running cannot be deleted and is left for the
+// next install; that is not an error.
+func removeSetAside(path string) {
+	old, _ := filepath.Glob(path + ".old-*")
+	for _, f := range old {
+		os.Remove(f)
+	}
+}
+
+// hostBinaryName is the file the backend is installed as. Windows needs the
+// .exe: browsers start native hosts there through cmd.exe, which will not run
+// a file without it.
+func hostBinaryName() string {
+	if runtime.GOOS == "windows" {
+		return "ts-browser-ext.exe"
+	}
+	return "ts-browser-ext"
+}
+
+// hostManifest returns the native messaging registration for browserByte,
+// pointing at binPath. It is marshaled rather than formatted because a
+// Windows path is full of backslashes, which a JSON string has to escape.
+func hostManifest(browserByte, extension, binPath string) ([]byte, error) {
+	m := struct {
+		Name              string   `json:"name"`
+		Description       string   `json:"description"`
+		Path              string   `json:"path"`
+		Type              string   `json:"type"`
+		AllowedOrigins    []string `json:"allowed_origins,omitempty"`
+		AllowedExtensions []string `json:"allowed_extensions,omitempty"`
+	}{
+		Name:        hostName(browserByte),
+		Description: "TailExt native backend",
+		Path:        binPath,
+		Type:        "stdio",
+	}
+	switch browserByte {
+	case "C":
+		m.AllowedOrigins = []string{"chrome-extension://" + extension + "/"}
+	case "F":
+		m.AllowedExtensions = []string{firefoxExtensionID}
+	default:
+		return nil, fmt.Errorf("unknown browser prefix byte %q", browserByte)
+	}
+	b, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	return append(b, '\n'), nil
 }
 
 func install(installArg string) error {
@@ -334,51 +415,38 @@ func install(installArg string) error {
 	if err != nil {
 		return err
 	}
-	targetBin := filepath.Join(targetDir, "ts-browser-ext")
+	targetBin := filepath.Join(targetDir, hostBinaryName())
 	if err := replaceFile(targetBin, binary, 0755); err != nil {
 		return err
 	}
 	log.SetFlags(0)
 	log.Printf("copied binary to %v", targetBin)
 
-	var targetJSON string
-	var jsonConf []byte
-
-	switch browserByte {
-	case "C":
-		targetJSON = filepath.Join(targetDir, chromeHostName+".json")
-		jsonConf = fmt.Appendf(nil, `{
-		"name": "%s",
-		"description": "TailExt native backend",
-		"path": "%s",
-		"type": "stdio",
-		"allowed_origins": [
-			"chrome-extension://%s/"
-		]
-	  }`, chromeHostName, targetBin, extension)
-	case "F":
-		targetJSON = filepath.Join(targetDir, firefoxHostName+".json")
-		jsonConf = fmt.Appendf(nil, `{
-		"name": "%s",
-		"description": "TailExt native backend",
-		"path": "%s",
-		"type": "stdio",
-		"allowed_extensions": [
-			"%s"
-		]
-	  }`, firefoxHostName, targetBin, firefoxExtensionID)
-	default:
-		return fmt.Errorf("unknown browser prefix byte %q", browserByte)
+	name := hostName(browserByte)
+	jsonConf, err := hostManifest(browserByte, extension, targetBin)
+	if err != nil {
+		return err
 	}
+	targetJSON := filepath.Join(targetDir, name+".json")
 	if err := os.WriteFile(targetJSON, jsonConf, 0644); err != nil {
 		return err
 	}
 	log.Printf("wrote registration to %v", targetJSON)
+	if key, err := registerHost(browserByte, name, targetJSON); err != nil {
+		return err
+	} else if key != "" {
+		log.Printf("pointed %v at it", key)
+	}
 	log.Printf("a backend that is already running keeps the old code: reload the extension so the browser starts the new one")
 
 	// Clear registrations from before the rename, so the browser cannot find
 	// two hosts and so nothing is left pointing at a binary we no longer own.
 	for _, name := range legacyHostNames {
+		if key, err := unregisterHost(browserByte, name); err != nil {
+			return err
+		} else if key != "" {
+			log.Printf("removed stale registration %v", key)
+		}
 		old := filepath.Join(targetDir, name+".json")
 		if err := os.Remove(old); err == nil {
 			log.Printf("removed stale registration %v", old)
