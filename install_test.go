@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"os"
 	"regexp"
+	"slices"
 	"testing"
 
 	"tailscale.com/ipn"
@@ -62,6 +63,45 @@ func TestInstallRejectsBadChromeID(t *testing.T) {
 	} {
 		if err := install(arg); err == nil {
 			t.Errorf("install(%q) was accepted; expected it to be rejected", arg)
+		}
+	}
+}
+
+// TestHostManifestEscapesWindowsPaths keeps the registration valid on
+// Windows. The manifest used to be formatted with the path pasted between
+// quotes, and a Windows path is full of backslashes: "C:\Users\..." is not
+// valid JSON, and the browser would reject the host it had been pointed at.
+func TestHostManifestEscapesWindowsPaths(t *testing.T) {
+	const bin = `C:\Users\Jane Doe\AppData\Local\tailscale-browser-ext\NativeMessagingHosts\ts-browser-ext.exe`
+	const chromeID = "abcdefghijklmnopabcdefghijklmnop"
+	for _, tt := range []struct {
+		browserByte string
+		name        string
+		origins     []string
+		extensions  []string
+	}{
+		{"C", chromeHostName, []string{"chrome-extension://" + chromeID + "/"}, nil},
+		{"F", firefoxHostName, nil, []string{firefoxExtensionID}},
+	} {
+		b, err := hostManifest(tt.browserByte, chromeID, bin)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got struct {
+			Name              string   `json:"name"`
+			Path              string   `json:"path"`
+			Type              string   `json:"type"`
+			AllowedOrigins    []string `json:"allowed_origins"`
+			AllowedExtensions []string `json:"allowed_extensions"`
+		}
+		if err := json.Unmarshal(b, &got); err != nil {
+			t.Fatalf("%s manifest is not valid JSON: %v\n%s", tt.browserByte, err, b)
+		}
+		if got.Name != tt.name || got.Path != bin || got.Type != "stdio" {
+			t.Errorf("%s manifest = %+v", tt.browserByte, got)
+		}
+		if !slices.Equal(got.AllowedOrigins, tt.origins) || !slices.Equal(got.AllowedExtensions, tt.extensions) {
+			t.Errorf("%s manifest allows origins %q, extensions %q", tt.browserByte, got.AllowedOrigins, got.AllowedExtensions)
 		}
 	}
 }
