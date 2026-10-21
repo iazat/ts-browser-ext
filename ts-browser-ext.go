@@ -35,7 +35,6 @@ import (
 	"tailscale.com/tsd"
 	"tailscale.com/tsnet"
 	"tailscale.com/types/logger"
-	"tailscale.com/types/netmap"
 )
 
 var (
@@ -480,7 +479,6 @@ type host struct {
 	// lastSentStatus is the status last written to the extension, encoded,
 	// so that emitStatus can avoid repeating itself.
 	lastSentStatus  []byte
-	lastNetmap      *netmap.NetworkMap
 	lastState       ipn.State
 	lastBrowseToURL string
 	// exitNodeSet reports whether the preferences name an exit node. It
@@ -1091,11 +1089,9 @@ func (h *host) startTailscaleErr(ctx context.Context, id string) error {
 
 // ipnWatchMask is what the backend is asked to report.
 //
-// NotifyInitialNetMap matters: without it the first netmap only arrives when
-// something about the tailnet happens to change, so a backend that comes up
-// already logged in reports an empty tailnet name until then. It is not one
-// of NotifyRateLimitIncompatibleBits, so it combines.
-const ipnWatchMask = ipn.NotifyInitialState | ipn.NotifyInitialNetMap | ipn.NotifyInitialPrefs | ipn.NotifyRateLimit
+// The bus no longer carries the netmap (tailscale 1.104 rejects the bits that
+// asked for it), so the tailnet name comes from LocalAPI Status in emitStatus.
+const ipnWatchMask = ipn.NotifyInitialState | ipn.NotifyInitialPrefs
 
 // watchIPNBus keeps a subscription to the backend's notifications open for
 // as long as ctx lives, resubscribing whenever one ends.
@@ -1107,7 +1103,7 @@ const ipnWatchMask = ipn.NotifyInitialState | ipn.NotifyInitialNetMap | ipn.Noti
 // is slow enough to fall behind. When it happened, the status carried
 // "WatchIPNBus stopped" for the rest of the process's life: the toggle
 // looked broken and the exit node picker vanished, with the tailnet in fact
-// fine. Resubscribing gets the initial state, netmap and prefs again, so
+// fine. Resubscribing gets the initial state and prefs again, so
 // nothing is lost but the gap.
 func (h *host) watchIPNBus(ctx context.Context, lc *local.Client) {
 	delay := time.Second
@@ -1163,9 +1159,6 @@ func (h *host) updateFromWatcher(wc *local.IPNBusWatcher) bool {
 	}
 
 	h.mu.Lock()
-	if n.NetMap != nil {
-		h.lastNetmap = n.NetMap
-	}
 	if n.State != nil {
 		h.lastState = *n.State
 	}
@@ -1371,9 +1364,6 @@ func (h *host) emitStatus(force bool) {
 	st := &status{}
 	h.mu.Lock()
 	st.Running = h.lastState == ipn.Running
-	if nm := h.lastNetmap; nm != nil {
-		st.Tailnet = nm.Domain
-	}
 	if h.lastState == ipn.NeedsLogin {
 		st.NeedsLogin = true
 		st.BrowseToURL = h.lastBrowseToURL
@@ -1395,10 +1385,7 @@ func (h *host) emitStatus(force bool) {
 		ctx, cancel := context.WithTimeout(context.Background(), localAPITimeout)
 		defer cancel()
 		if full, err := lc.Status(ctx); err == nil {
-			// The management page reads the tailnet from here and got it
-			// right while the popup showed nothing, so trust this when
-			// the netmap has not given us a name.
-			if st.Tailnet == "" && full.CurrentTailnet != nil {
+			if full.CurrentTailnet != nil {
 				st.Tailnet = full.CurrentTailnet.Name
 			}
 			prefID, prefIP, prefsOK := configuredExitNode(lc, h.logf)
